@@ -1,0 +1,147 @@
+
+tenshoku.mynavi.jp
+Windows Terminalとは？新たな多機能ターミナルアプリを紹介！
+13〜18 分
+Windows TerminalがWindows11のデフォルトターミナルに？
+
+img_windowsterminal_01
+
+2022年8月24日（米時間）、MicrosoftはDevチャンネル※にリリースした「Windows 11 Insider Preview Build 25188」から、「Windows Terminal」をWindows11のデフォルトターミナルに設定したと発表しました。
+
+Windows TerminalはWindows 11で既にデフォルトターミナルとして設定することが可能でしたが、この発表により公式にWindows 11の標準ターミナルアプリケーションとなりました。
+
+※Devチャンネルとは、Windowsの最新機能や更新プログラムをいち早く知りたいエンジニアを対象としたチャンネルのことです。
+
+【参考】：Announcing Windows 11 Insider Preview Build 25188｜Windows blog
+
+Windowsターミナルとは？概要・機能から使い方まで解説！
+
+img_windowsterminal_02
+
+初めてWindows Terminalに触れた方は、これまでのコマンドプロンプトやPowerShellと何が違うのかが分かりにくいため、あまり目新しさを感じないかもしれませんが、使ってみると違いに驚くでしょう。これからWindows Terminalとは何なのか、これまでのアプリとは何が違うのかを中心に見ていきましょう。
+
+「Windows Terminal」は、Microsoft開発のWindowsターミナルアプリケーションですが、正式版のWindows Terminalが登場したのは2020年6月に遡ります。
+
+Windows TerminalはMicrosoft製品ですが、MITライセンス（再利用などの自由性が高いオープンソースライセンス）で誰もが無料で利用できます。Microsoft Storeアプリに登録されており、誰でも簡単にWindows環境にインストールできます。
+
+では、ターミナルアプリケーションとは何なのでしょうか。Macユーザーは「ターミナル」アプリに馴染みがあると思いますが、ターミナルアプリは「CUI（Character User Interface）」ツールとも呼ばれ、テキストベースのコマンドを使って、コンピュータを対話的に操作するためのアプリのことです。
+
+Windowsにも「コマンドプロンプト」や「Powershell」など「Windows Console」と呼ばれるターミナルアプリがありましたが、利用は一部の方に限られていました。今回発表されたWindows Terminalはこれまでの「Windows Console」の概念を覆す新たなターミナルアプリとして注目されています。
+
+【参考】：Windows Terminal ｜Microsoft Store アプリ
+
+MITライセンスとは？詳細や注意点、利用してできることを解説
+
+PowerShellとは？できること・コマンドをわかりやすく解説
+
+これまでのWindowsにもコマンドプロンプトやPowershellなど、Windows Consoleと呼ばれるターミナルアプリがありました。Windows環境でCUI操作する際には、コマンドプロンプトや機能が拡張されたPowerShellウィンドウを利用して、特に問題を感じることはありませんでした。
+
+PowerShellではCOMポートによるシリアル通信にも対応し、WindowsハイパーターミナルやフリーソフトのTeraTermの機能を吸収し、多機能ターミナルアプリとして存在しています。では、何故わざわざWindows Terminalを開発したのでしょうか？
+
+それは、コマンドプロンプトやPowershellなど、Windows ConsoleはWindowsに限定されたターミナルアプリであり、LinuxなどUNIX系環境向けに作られたターミナルアプリとは根本的なコンセプトや機能が異なっているからです。Windows Consoleでは Linuxコマンドを直接利用することができませんでした。
+
+PowerShellではコマンドプロンプトを大幅に機能アップし、コマンドレット（cmdlets）と呼ばれる独自コマンドによって複雑なCUI操作を可能にしました。
+
+しかし Linuxコマンドを実行する際には、Windows上にLinux環境を実現するWSL（Windows Subsystem for Linux）のインストールが必要であり、かつPowerShellでLinuxコマンドを入力する際に、毎回コマンドの先頭に「wsl」を入力する必要があるなど、いくつか制約がありました。
+
+他に「Git Bash」を利用して、Windows上でLinuxシェルを利用する方法もありますが、いずれにしてもGitの概念から理解する必要があり、初心者にはあまりおすすめできません。
+
+そこで、Microsoftはこれまで十分ではなかったLinux互換を推進するために、多機能・高機能ターミナルアプリケーションとしてWindows Terminalの開発に至りました。
+
+【参考】：PowerShell ドキュメント - PowerShell | Microsoft Docs
+
+【参考】：WSL のインストール | Microsoft Docs
+
+Git Bashとは？WindowsのLinuxツールを解説！
+
+Microsoftは、Windows ConsoleをLinixなどUNIX系との互換性を高める新たなオープンソースプロジェクトとして、Windows Terminalの開発を進めましたが、ここではWindows Terminalの特徴について紹介します。
+
+?利用できるのはWindows10およびWindows11
+
+?Windows11ではデフォルトのターミナルアプリとなる予定
+
+?Microsoft Store、GitHubページなどから無償ダウンロードが可能
+
+?Azure Cloud Shell、Oh-My-Zsh、Ubuntu などのアプリケーションをターミナル内から実行できる
+
+?コマンドプロンプト、PowerShell、WSLなどの複数のシェルを分割して表示することが可能
+
+?カスタマイズ性が高く、ターミナルの背景色・壁紙、フォントを変更できる
+
+?UTF-8やUnicodeがサポートされている
+
+?右クリックやショートカットを使わず、自動的にテキストのコピーができる
+
+?GPUにより高速化されたテキストレンダリングエンジンをサポートしている
+
+Windows Terminalには以上のように豊富な特徴があります。無料で利用できますので、ぜひ試してみてください。
+
+【参考】：Azure Cloud Shell の概要 | Microsoft Docs
+
+【参考】：Oh My Zsh - a delightful & open source framework for Zsh
+
+【参考】：Ubuntu Japanese Team｜Homepage
+Windows Terminalを使うには
+
+img_windowsterminal_03
+
+Windows11には、既にWindows Terminalがインストールされています。利用してみたい方は、以下の手順を踏んで、利用環境を整えてから使ってみてください。
+
+Windows10の方はWindows Storeからインストールする必要がありますので、下記のWindows StoreからWindows Terminalを入手してください。インストールすると、Windows10ではスタートメニューから起動できます。ストア以外では、Windows Terminalの公式GitHubからダウンロードする方法もあります。
+
+【参考】：Windows Terminal ｜ Microsoft Store アプリ
+
+【参考】：Releases ・ microsoft/terminal ・ GitHub
+
+Windows11では、タスクバー左端の「スタートボタン」を右クリックするとその上にメニューが表示されますので、中ほどにある「Windows ターミナル」を選択します。起動すると以下のメッセージが表示されます。
+
+Windows PowerShell
+Copyright (C) Microsoft Corporation. All rights reserved.
+新機能と改善のために最新の PowerShell をインストールしてください!https://aka.ms/PSWindows
+PS C:\Usersユーザー名>
+
+最新のPower Shellをインストールするように促すメッセージが表示されますので、「https://aka.ms/PSWindows」をCtrlキーを押しながらクリックし、移動したページの右上にある［PowerShellのダウンロード］ボタンをクリックします。
+
+ダウンロードページに移動したら、画面下の「▼Assets」にある「PowerShell-7.2.6-win-x64.msi」※をクリックし、インストーラーのダウンロードとインストールを行います。
+
+※2022年9月1日時点では、PowerShell-7.2.6-win-x64.msiが最新バージョンです。
+
+インストール画面に従って、デフォルト表示のままで［NEXT］ボタンをクリックし、セットアップダイアログ画面に進んだら［Install］ボタンをクリックするとインストールが始まります。
+
+インストールが終了し、セットアップウィザード完了ダイアログが表示されたら、［Finish］ボタンをクリックしてインストール完了です。以上の操作により、Windows TerminalでPowerShellの最新版を利用することができます。
+
+ちなみにPowerShellのコマンド一覧を表示したい時は、以下のコマンドを入力するとコマンド一覧を確認できます。
+
+PS C:> Get-Command -CommandType Cmdlet | Select-Object Name
+
+Windows上でLinuxを使いたい方は、WSL（Windows Subsystem for Linux）をインストールしておきましょう。WSLのインストールはWindowsターミナル（管理者権限）で行います。Windows Terminalの画面で以下のコマンドを入力するだけでWSLは自動的にインストールされます。
+
+wsl  --install
+
+WSLをインストールすると、同時にUbuntuディストリビューションがインストールされます。
+
+インストールが終了すると再起動が要求されますので、アプリを終了してPCを再起動します。再起動が済むとWindows Terminalが自動的に起動されますので、UNIXユーザー名（英数小文字で任意の名前を入力）、パスワード（画面上では見えないが、同じパスワードを2回入力）します。
+
+以降、Windows Terminalを開いた際にメニューの「+」ボタンで新規タブを開き、下矢印ボタンをクリックして「Ubuntu」を選ぶと以下のようなシェルが開きます。試しにdateコマンドを入れると、
+
+ユーザー名@コンピューター名:~$ date
+Fri Sep  2 15:33:05 JST 2022
+
+以上のように日付を確認することができます。以下のように「explorer.exe」と入力すると、
+
+ユーザー@LAPTOP-TG66NLAA:~$ explorer.exe
+
+exploreのウィンドウが起動します。
+
+このようにWSL環境から「explorer.exe」を実行することで、Windowsプログラムから直接WSL環境のファイルを編集することが可能です。
+
+今回はWSLのUbuntu環境を作ってみましたが、「apt」※などパッケージツールを利用し、好みのソフトウェアをインストールすることも可能です。
+
+【参考】：※Apt - Debian Wiki
+Windows Terminalを使いこなそう
+
+img_ryousicompenginner_04
+
+Windows11のデフォルトターミナルとなる「Windows Terminal」について、その概要や利用環境の作成方法などについて解説しました。Windows Terminalを利用することで、これまでのWindows環境とは比較にならないくらい簡単にLinux風の開発環境が作れ、さまざまな便利な機能を使えるようになります。
+
+Windows11を使いながらCUIやLinux環境を利用したい方は、Windows Terminalの利用をおすすめしますので、ぜひ試してみてください。

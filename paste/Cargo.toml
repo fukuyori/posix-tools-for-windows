@@ -1,0 +1,19 @@
+[package]
+name = "paste"
+version = "0.1.0"
+edition = "2021"
+authors = ["fukuyori"]
+description = "POSIX準拠のpasteコマンド（GNU拡張対応）"
+license = "MIT"
+repository = "https://github.com/fukuyori/posix-tools-for-windows.git"
+keywords = ["cli", "paste", "unix", "posix"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+glob = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

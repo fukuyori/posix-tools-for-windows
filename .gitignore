@@ -1,0 +1,10 @@
+**/target/
+**/target_verify/
+**/target-posix/
+*.zip
+*.exe
+*.pdb
+*.d
+*.dll
+*.dll.exp
+*.dll.lib

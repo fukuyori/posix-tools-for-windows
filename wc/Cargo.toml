@@ -1,0 +1,18 @@
+[package]
+name = "wc"
+version = "1.0.0"
+edition = "2021"
+authors = ["Your Name"]
+description = "Unix wc互換の行数・単語数・文字数カウントツール (Windows版)"
+license = "MIT"
+repository = "https://github.com/fukuyori/posix-tools-for-windows.git"
+
+[dependencies]
+encoding_rs = "0.8"
+glob = "0.3"
+unicode-width = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

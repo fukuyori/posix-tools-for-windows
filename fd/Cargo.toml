@@ -1,0 +1,31 @@
+[package]
+name = "fd-rs"
+version = "1.0.0"
+edition = "2021"
+description = "高速でユーザーフレンドリーなファイル検索 (fd互換実装)"
+authors = ["Your Name"]
+license = "MIT"
+repository = "https://github.com/fukuyori/posix-tools-for-windows.git"
+
+[[bin]]
+name = "fd"
+path = "src/main.rs"
+
+[dependencies]
+glob = "0.3.3"
+regex = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

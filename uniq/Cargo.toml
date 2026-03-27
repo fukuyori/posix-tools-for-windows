@@ -1,0 +1,21 @@
+[package]
+name = "uniq"
+version = "0.1.0"
+edition = "2021"
+authors = ["fukuyori"]
+description = "POSIX準拠のuniqコマンド（GNU拡張対応）"
+license = "MIT"
+repository = "https://github.com/fukuyori/posix-tools-for-windows.git"
+keywords = ["cli", "uniq", "unix", "posix"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+glob = "0.3"
+encoding_rs = "0.8"
+encoding_rs_io = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

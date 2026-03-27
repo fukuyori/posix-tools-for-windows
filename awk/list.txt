@@ -1,0 +1,7 @@
+[1;32mawk.exe[0m             [1;32mgrep.exe[0m            [1;32mps.exe[0m              [1;32mtop.exe[0m
+[1;32mcat.exe[0m             [1;32mhead.exe[0m            [1;32mpwd.exe[0m             [1;32mtouch.exe[0m
+[1;32mcp.exe[0m              [1;32mkill.exe[0m            [1;32mrm.exe[0m              [1;32mwc.exe[0m
+[1;32mcut.exe[0m             [1;32mless.exe[0m            SDL2.dll            [1;32mwhich.exe[0m
+[1;32mdf.exe[0m              [1;32mls.exe[0m              [1;32msed.exe[0m
+[1;32mdu.exe[0m              [1;32mman.exe[0m             [1;32mSnapNoteStudio.exe[0m
+[1;32mfd.exe[0m              [1;32mmv.exe[0m              [1;32mtail.exe[0m
