@@ -1,6 +1,8 @@
 **/target/
 **/target_verify/
 **/target-posix/
+cat/.tmp_test/
+cp/tmp/
 *.zip
 *.exe
 *.pdb
