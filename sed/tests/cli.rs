@@ -1,6 +1,7 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn test_dir(name: &str) -> PathBuf {
@@ -31,6 +32,24 @@ fn run_sed_in_dir(dir: &Path, args: &[&str]) -> std::process::Output {
         .args(args)
         .output()
         .unwrap()
+}
+
+/// stdin に `input` を流し込んで sed を実行し、stdout / stderr / status を返す。
+fn run_sed_stdin(args: &[&str], input: &str) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sed"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
 }
 
 #[test]
@@ -182,4 +201,64 @@ fn cli_write_command_writes_matched_lines_to_a_file() {
     assert_eq!(fs::read_to_string(&out).unwrap(), "keep\n");
 
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn block_command_with_semicolons_runs_all_commands() {
+    // POSIX `{cmd1;cmd2}` ブロックが正しくパースされて両コマンドが順に実行されること。
+    let output = run_sed_stdin(
+        &["-n", "-e", "/^#/{s/^# *//;p}"],
+        "#!/bin/sh\n# hi\nx\n",
+    );
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "!/bin/sh\nhi\n"
+    );
+}
+
+#[test]
+fn multiple_e_args_compose_as_one_script() {
+    // 複数の `-e` がブロックを含んでも正しく連結・実行されること。
+    let output = run_sed_stdin(
+        &[
+            "-n",
+            "-e", "/^#!/d",
+            "-e", "/^#/{s/^# *//;p}",
+            "-e", "/^[^#]/q",
+        ],
+        "#!/bin/sh\n# hi\nx\n",
+    );
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "hi\n");
+}
+
+#[test]
+fn parse_error_identifies_offending_e_argument() {
+    // 2 つ目の -e で不正コマンド。エラーメッセージに `-e #2` と位置情報が含まれること。
+    let output = run_sed_stdin(&["-e", "/abc/d", "-e", "WOOPS"], "");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("-e #2"), "stderr was: {stderr}");
+    assert!(stderr.contains("位置"), "stderr was: {stderr}");
+    assert!(stderr.contains("'W'"), "stderr was: {stderr}");
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn msys_path_mangling_emits_helpful_hint_on_windows() {
+    // MSYS で起こりがちな「argv に Windows 化パスが混入」したケースを再現し、
+    // ヒントが付くことを確認する。
+    let output = run_sed_stdin(&["-e", r"C:\Program Files\Git\^h\p"], "");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("MSYS"), "stderr was: {stderr}");
+    assert!(
+        stderr.contains("MSYS_NO_PATHCONV"),
+        "stderr was: {stderr}"
+    );
 }

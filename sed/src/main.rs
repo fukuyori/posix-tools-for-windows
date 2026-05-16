@@ -11,6 +11,17 @@ use encoding_rs::{EUC_JP, SHIFT_JIS, UTF_8};
 use fancy_regex::{Error as FancyRegexError, Regex, RegexBuilder};
 use glob;
 
+/// スクリプト断片の出所。エラー報告でどの -e / -f に由来するか特定するために使う。
+#[derive(Debug, Clone)]
+struct ScriptOrigin {
+    /// 表示用ラベル。例: "-e #1", "ファイル 'script.sed'"
+    label: String,
+    /// ユーザが渡した原文（連結用の '\n' は含まない）
+    source: String,
+    /// 連結後スクリプト中での開始文字位置
+    start: usize,
+}
+
 #[derive(Default)]
 struct Options {
     // POSIX標準オプション
@@ -137,18 +148,25 @@ fn main() {
     }
 
     if opts.show_version {
-        println!("sed (Rust版) 1.0.0");
+        println!("sed (Rust版) 2.1.0");
         println!("POSIX.1-2017 寄り + GNU/Windows 拡張");
         std::process::exit(0);
     }
 
-    // スクリプトを構築
+    // スクリプトを構築（エラー報告のために断片の出所を記録する）
     let mut script = String::new();
-    for expr in &opts.expressions {
+    let mut origins: Vec<ScriptOrigin> = Vec::new();
+    for (i, expr) in opts.expressions.iter().enumerate() {
         if !script.is_empty() { script.push('\n'); }
         // Windowsでシングルクォートが残っている場合は除去
         let expr = expr.trim_matches('\'');
+        let start = script.chars().count();
         script.push_str(expr);
+        origins.push(ScriptOrigin {
+            label: format!("-e #{}", i + 1),
+            source: expr.to_string(),
+            start,
+        });
     }
 
     for script_file in &opts.script_files {
@@ -156,7 +174,13 @@ fn main() {
         match fs::read_to_string(&script_path) {
             Ok(content) => {
                 if !script.is_empty() { script.push('\n'); }
+                let start = script.chars().count();
                 script.push_str(&content);
+                origins.push(ScriptOrigin {
+                    label: format!("ファイル '{}'", script_file),
+                    source: content,
+                    start,
+                });
             }
             Err(e) => {
                 eprintln!("sed: '{}' を読み込めません: {}", script_file, format_error(&e));
@@ -170,10 +194,10 @@ fn main() {
         std::process::exit(2);
     }
 
-    let mut commands = match parse_script(&script) {
+    let mut commands = match parse_script_at(&script) {
         Ok(cmds) => cmds,
-        Err(e) => {
-            eprintln!("sed: {}", e);
+        Err((pos, msg)) => {
+            eprintln!("sed: {}", format_script_error(pos, &msg, &origins));
             std::process::exit(1);
         }
     };
@@ -466,7 +490,13 @@ Windows では `*`, `?`, `[]` を内部で展開します。先頭 `.` は明示
   sed -E 's/[0-9]+/NUM/g' file.txt   拡張正規表現で数字をNUMに置換"#);
 }
 
+#[cfg(test)]
 fn parse_script(script: &str) -> Result<Vec<SedCommand>, String> {
+    parse_script_at(script).map_err(|(_, m)| m)
+}
+
+/// `parse_script` の位置情報付きバージョン。エラー時に「連結後スクリプト中の文字位置」を返す。
+fn parse_script_at(script: &str) -> Result<Vec<SedCommand>, (usize, String)> {
     let mut commands = Vec::new();
     let chars: Vec<char> = script.chars().collect();
     let mut pos = 0;
@@ -480,10 +510,114 @@ fn parse_script(script: &str) -> Result<Vec<SedCommand>, String> {
             continue;
         }
         if chars[pos] == ';' { pos += 1; continue; }
-        commands.push(parse_sed_command(&chars, &mut pos)?);
+        let cmd_start = pos;
+        match parse_sed_command(&chars, &mut pos) {
+            Ok(cmd) => commands.push(cmd),
+            Err(msg) => {
+                // pos はエラー検知時点で 1〜数文字進んでいることが多い。
+                // 直前のコマンド開始位置以降に丸めた上で 1 文字戻す（不明コマンド系で最も役に立つ位置になる）。
+                let err_pos = pos.saturating_sub(1).max(cmd_start).min(chars.len());
+                return Err((err_pos, msg));
+            }
+        }
     }
-    normalize_empty_regexes(&mut commands)?;
+    normalize_empty_regexes(&mut commands).map_err(|m| (pos, m))?;
     Ok(commands)
+}
+
+/// 連結後スクリプト中の文字位置 `pos` から、対応する `ScriptOrigin` を引き当てる。
+fn locate_origin(pos: usize, origins: &[ScriptOrigin]) -> Option<(&ScriptOrigin, usize)> {
+    // origins は start で昇順かつ非重複である前提（main() で連結順に作っている）。
+    // pos に対して start <= pos となる最後の origin を採用する。
+    let mut chosen: Option<&ScriptOrigin> = None;
+    for origin in origins {
+        if origin.start <= pos {
+            chosen = Some(origin);
+        } else {
+            break;
+        }
+    }
+    chosen.map(|o| {
+        let source_len = o.source.chars().count();
+        let local = pos.saturating_sub(o.start).min(source_len);
+        (o, local)
+    })
+}
+
+/// パースエラーを「どの -e のどの位置か」を示す形に整形し、必要に応じて MSYS ヒントを付ける。
+fn format_script_error(pos: usize, msg: &str, origins: &[ScriptOrigin]) -> String {
+    let mut out = String::new();
+    let located = locate_origin(pos, origins);
+    if let Some((origin, local)) = located {
+        out.push_str(&format!("{}, 位置 {}: {}", origin.label, local + 1, msg));
+        // 該当行と矢印を表示（source が複数行のときは局所的に切り出す）
+        let line_info = line_and_column(&origin.source, local);
+        out.push('\n');
+        out.push_str(&format!("  {}\n", line_info.line));
+        out.push_str(&format!("  {}^", " ".repeat(line_info.column)));
+        if let Some(hint) = msys_hint_if_applicable(msg, &origin.source) {
+            out.push('\n');
+            out.push_str(&hint);
+        }
+    } else {
+        out.push_str(msg);
+    }
+    out
+}
+
+struct LineInfo<'a> {
+    line: &'a str,
+    /// 当該行内での 0 始まりカラム位置（文字単位）
+    column: usize,
+}
+
+/// `source` 内の `char_offset` 位置を含む行と、その行内カラムを返す。
+fn line_and_column(source: &str, char_offset: usize) -> LineInfo<'_> {
+    let mut chars_seen = 0usize;
+    for line in source.split('\n') {
+        let line_chars = line.chars().count();
+        // この行の文字範囲は [chars_seen, chars_seen + line_chars]。
+        // +1 は改行ぶんだが、最終行は改行を持たないため offset = end_of_input でもこの行に当てる。
+        if char_offset <= chars_seen + line_chars {
+            return LineInfo {
+                line,
+                column: char_offset.saturating_sub(chars_seen),
+            };
+        }
+        chars_seen += line_chars + 1; // 改行ぶん
+    }
+    LineInfo {
+        line: source,
+        column: char_offset.min(source.chars().count()),
+    }
+}
+
+/// Windows + Git Bash の MSYS 自動パス変換が原因と思われるエラーに対し、ユーザ向けヒントを返す。
+///
+/// 条件:
+///   * Windows 上で実行されている
+///   * 「不明なコマンド」エラーである
+///   * 該当する -e の原文が `<drive>:\...` または `<drive>:/...` で始まる
+fn msys_hint_if_applicable(msg: &str, source: &str) -> Option<String> {
+    if !cfg!(target_os = "windows") {
+        return None;
+    }
+    if !msg.starts_with("不明なコマンド") {
+        return None;
+    }
+    let bytes = source.as_bytes();
+    let looks_like_windows_path = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    if !looks_like_windows_path {
+        return None;
+    }
+    Some(
+        "ヒント: Git Bash / MSYS の自動パス変換により '/...' が Windows パスへ書き換えられた可能性があります。\n  \
+         回避策: 環境変数 MSYS_NO_PATHCONV=1 を設定するか、'//pat/' のように先頭スラッシュを二重にしてください。"
+            .to_string()
+    )
 }
 
 fn normalize_empty_regexes(commands: &mut [SedCommand]) -> Result<(), String> {
