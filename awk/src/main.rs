@@ -28,7 +28,7 @@ fn print_usage() {
 }
 
 fn print_version() {
-    eprintln!("awk-rs 0.1.0");
+    eprintln!("awk-rs 0.2.0");
     eprintln!("Rust で実装された POSIX AWK");
 }
 

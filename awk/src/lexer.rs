@@ -348,6 +348,7 @@ impl<'a> Lexer<'a> {
                 tok,
                 Token::LParen
                     | Token::LBrace
+                    | Token::RBrace
                     | Token::LBracket
                     | Token::Comma
                     | Token::Semicolon
@@ -645,5 +646,40 @@ mod tests {
     fn test_regex() {
         let mut lexer = Lexer::new("/^test$/");
         assert!(matches!(lexer.next_token(), Ok(Token::Regex(r)) if r == "^test$"));
+    }
+
+    #[test]
+    fn regex_after_action_block() {
+        // `{action} /regex/` — `/` after `}` must lex as a regex literal,
+        // not as division. This is the start of the next rule's pattern.
+        let mut lexer = Lexer::new("{next} /^#/");
+        let mut last = None;
+        loop {
+            let t = lexer.next_token().unwrap();
+            if matches!(t, Token::Eof) {
+                break;
+            }
+            last = Some(t);
+        }
+        assert!(matches!(last, Some(Token::Regex(p)) if p == "^#"));
+    }
+
+    #[test]
+    fn shebang_regex_in_compound_rule() {
+        // Full reproduction of the reported bug:
+        //   NR==1 && /^#!/ {next} /^#/ {print}
+        // Both `/^#!/` and `/^#/` must be lexed as Regex tokens.
+        let mut lexer = Lexer::new("NR==1 && /^#!/ {next} /^#/ {print}");
+        let mut regexes = Vec::new();
+        loop {
+            let t = lexer.next_token().unwrap();
+            if matches!(t, Token::Eof) {
+                break;
+            }
+            if let Token::Regex(p) = t {
+                regexes.push(p);
+            }
+        }
+        assert_eq!(regexes, vec!["^#!".to_string(), "^#".to_string()]);
     }
 }
