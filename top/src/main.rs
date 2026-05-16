@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::env;
 use std::io::{self, Write};
 use std::mem;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crossterm::{
@@ -15,14 +17,15 @@ use crossterm::{
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 
-use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::core::{PCSTR, PWSTR};
+use windows::Win32::Foundation::{CloseHandle, FreeLibrary, HANDLE};
 use windows::Win32::Security::{
     GetTokenInformation, LookupAccountSidW, TokenUser, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
 };
+use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
 use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
 use windows::Win32::System::SystemInformation::{
     GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX,
@@ -45,6 +48,9 @@ struct ProcessInfo {
     memory_vsz: u64,
     cpu_percent: f64,
     mem_percent: f64,
+    gpu_percent: Option<f64>,
+    gpu_mem_percent: Option<f64>,
+    gpu_memory_mb: Option<u64>,
     cpu_time: u64,
     status: String,
     kernel_time: u64,
@@ -65,6 +71,47 @@ struct SystemInfo {
     swap_total: u64,
     swap_used: u64,
     swap_free: u64,
+    gpus: Vec<GpuInfo>,
+    vulkan: Option<VulkanInfo>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct GpuInfo {
+    name: String,
+    utilization_percent: Option<f64>,
+    memory_total_mb: Option<u64>,
+    memory_used_mb: Option<u64>,
+    temperature_c: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct GpuProcessInfo {
+    gpu_percent: Option<f64>,
+    gpu_mem_percent: Option<f64>,
+    gpu_memory_mb: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct VulkanInfo {
+    api_version: VulkanVersion,
+    devices: Vec<VulkanDeviceInfo>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct VulkanDeviceInfo {
+    index: usize,
+    name: Option<String>,
+    device_type: Option<String>,
+    api_version: Option<String>,
+    driver_name: Option<String>,
+    driver_info: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct VulkanVersion {
+    major: u32,
+    minor: u32,
+    patch: u32,
 }
 
 struct CpuTimes {
@@ -121,6 +168,7 @@ struct TopState {
     secure_mode: bool,
     user_filter: Option<String>,
     pid_filter: Vec<u32>,
+    vulkan_info: Option<VulkanInfo>,
 }
 
 fn main() -> io::Result<()> {
@@ -163,6 +211,7 @@ fn main() -> io::Result<()> {
         secure_mode: opts.secure_mode,
         user_filter: opts.user_filter,
         pid_filter: opts.pid_filter,
+        vulkan_info: get_vulkan_info(),
     };
 
     if state.batch_mode {
@@ -351,11 +400,15 @@ GNU top拡張オプション:
   h, ?, F1         このヘルプを表示
 
 表示列:
+  ヘッダー  NVIDIA GPU が検出できる場合は使用率、VRAM、温度を表示
+            Vulkan ランタイムが検出できる場合は API バージョンを表示
   PID      プロセスID
   USER     実行ユーザー
   PRI      優先度（Windowsの基本優先度クラス）
   %CPU     CPU使用率
   %MEM     メモリ使用率
+  %GPU     GPU使用率（取得できる環境のみ）
+  GMEM     GPUメモリ使用率またはGPUメモリ使用量（取得できる環境のみ）
   VSZ      仮想メモリサイズ
   RSS      物理メモリ使用量
   S        状態（R=実行中, S=スリープ）
@@ -435,23 +488,45 @@ fn print_batch_output(state: &TopState) -> io::Result<()> {
         format_mib(sys.swap_free),
         format_mib(sys.swap_used)
     );
+    for gpu in &sys.gpus {
+        println!("{}", format_gpu_line(gpu));
+    }
+    if let Some(vulkan) = &sys.vulkan {
+        for line in format_vulkan_lines(vulkan) {
+            println!("{}", line);
+        }
+    }
     println!();
 
     // カラムヘッダー
     println!(
-        "{:>7} {:<10} {:>3} {:>5} {:>5} {:>9} {:>9} {:>1} {:>4} {:>9} {}",
-        "PID", "USER", "PRI", "%CPU", "%MEM", "VSZ", "RSS", "S", "THR", "TIME+", "COMMAND"
+        "{:>7} {:<10} {:>3} {:>5} {:>5} {:>5} {:>5} {:>9} {:>9} {:>1} {:>4} {:>9} {}",
+        "PID",
+        "USER",
+        "PRI",
+        "%CPU",
+        "%MEM",
+        "%GPU",
+        "GMEM",
+        "VSZ",
+        "RSS",
+        "S",
+        "THR",
+        "TIME+",
+        "COMMAND"
     );
 
     // プロセス一覧
     for proc in &state.processes {
         println!(
-            "{:>7} {:<10} {:>3} {:>5.1} {:>5.1} {:>9} {:>9} {:>1} {:>4} {:>9} {}",
+            "{:>7} {:<10} {:>3} {:>5.1} {:>5.1} {:>5} {:>5} {:>9} {:>9} {:>1} {:>4} {:>9} {}",
             proc.pid,
             truncate_str(&proc.user, 10),
             proc.priority,
             proc.cpu_percent,
             proc.mem_percent,
+            format_optional_percent(proc.gpu_percent),
+            format_gpu_memory(proc.gpu_mem_percent, proc.gpu_memory_mb),
             format_kb(proc.memory_vsz),
             format_kb(proc.memory_rss),
             proc.status,
@@ -646,7 +721,8 @@ fn update_data(state: &mut TopState) {
 
     // プロセス一覧
     let now = Instant::now();
-    let mut processes = get_processes(&state.prev_proc_times, now);
+    let gpu_processes = get_gpu_process_info();
+    let mut processes = get_processes(&state.prev_proc_times, &gpu_processes, now);
 
     // フィルタリング
     if let Some(ref user) = state.user_filter {
@@ -686,7 +762,275 @@ fn update_data(state: &mut TopState) {
         swap_total,
         swap_used: swap_total - swap_free,
         swap_free,
+        gpus: get_gpu_info(),
+        vulkan: state.vulkan_info.clone(),
     };
+}
+
+type VkEnumerateInstanceVersion = unsafe extern "system" fn(*mut u32) -> i32;
+
+const VK_SUCCESS: i32 = 0;
+
+fn get_vulkan_info() -> Option<VulkanInfo> {
+    let library = unsafe { LoadLibraryA(PCSTR(c"vulkan-1.dll".as_ptr().cast())) }.ok()?;
+
+    let version = unsafe {
+        let proc = GetProcAddress(
+            library,
+            PCSTR(c"vkEnumerateInstanceVersion".as_ptr().cast()),
+        );
+        match proc {
+            Some(proc) => {
+                let enumerate_instance_version: VkEnumerateInstanceVersion = mem::transmute(proc);
+                let mut raw_version = 0;
+                if enumerate_instance_version(&mut raw_version) == VK_SUCCESS {
+                    Some(VulkanVersion::from_raw(raw_version))
+                } else {
+                    None
+                }
+            }
+            None => Some(VulkanVersion {
+                major: 1,
+                minor: 0,
+                patch: 0,
+            }),
+        }
+    };
+
+    unsafe {
+        let _ = FreeLibrary(library);
+    }
+
+    version.map(|api_version| VulkanInfo {
+        api_version,
+        devices: get_vulkan_devices_from_summary(),
+    })
+}
+
+fn get_vulkan_devices_from_summary() -> Vec<VulkanDeviceInfo> {
+    let output = match Command::new("vulkaninfo").arg("--summary").output() {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+
+    parse_vulkaninfo_summary(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_vulkaninfo_summary(summary: &str) -> Vec<VulkanDeviceInfo> {
+    let mut devices = Vec::new();
+    let mut current: Option<VulkanDeviceInfo> = None;
+
+    for line in summary.lines() {
+        let trimmed = line.trim();
+        if let Some(index) = parse_vulkan_device_header(trimmed) {
+            if let Some(device) = current.take() {
+                devices.push(device);
+            }
+            current = Some(VulkanDeviceInfo {
+                index,
+                ..Default::default()
+            });
+            continue;
+        }
+
+        let Some(device) = current.as_mut() else {
+            continue;
+        };
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "apiVersion" => device.api_version = Some(value.to_string()),
+            "deviceType" => device.device_type = Some(format_vulkan_device_type(value)),
+            "deviceName" => device.name = Some(value.to_string()),
+            "driverName" => device.driver_name = Some(value.to_string()),
+            "driverInfo" => device.driver_info = Some(value.to_string()),
+            _ => {}
+        }
+    }
+
+    if let Some(device) = current {
+        devices.push(device);
+    }
+
+    devices
+}
+
+fn parse_vulkan_device_header(line: &str) -> Option<usize> {
+    line.strip_prefix("GPU")
+        .and_then(|rest| rest.strip_suffix(':'))
+        .and_then(|index| index.parse().ok())
+}
+
+fn format_vulkan_device_type(device_type: &str) -> String {
+    device_type
+        .strip_prefix("PHYSICAL_DEVICE_TYPE_")
+        .unwrap_or(device_type)
+        .replace('_', " ")
+        .to_ascii_lowercase()
+}
+
+fn get_gpu_info() -> Vec<GpuInfo> {
+    get_nvidia_gpu_info()
+}
+
+fn get_nvidia_gpu_info() -> Vec<GpuInfo> {
+    let output = match run_nvidia_smi(&[
+        "--query-gpu=name,utilization.gpu,memory.total,memory.used,temperature.gpu",
+        "--format=csv,noheader,nounits",
+    ]) {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .filter_map(parse_nvidia_smi_gpu_line)
+        .collect()
+}
+
+fn get_gpu_process_info() -> HashMap<u32, GpuProcessInfo> {
+    let mut processes = get_nvidia_pmon_process_info();
+    for (pid, info) in get_nvidia_compute_process_info() {
+        processes.entry(pid).or_insert(info);
+    }
+    processes
+}
+
+fn get_nvidia_pmon_process_info() -> HashMap<u32, GpuProcessInfo> {
+    let output = match run_nvidia_smi(&["pmon", "-c", "1"]) {
+        Ok(output) if output.status.success() => output,
+        _ => return HashMap::new(),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .filter_map(parse_nvidia_pmon_process_line)
+        .collect()
+}
+
+fn parse_nvidia_pmon_process_line(line: &str) -> Option<(u32, GpuProcessInfo)> {
+    let fields: Vec<_> = line.split_whitespace().collect();
+    if fields.len() < 5 || line.trim_start().starts_with('#') {
+        return None;
+    }
+
+    let pid = fields[1].parse().ok()?;
+    let gpu_percent = parse_optional_f64(fields[3]);
+    let gpu_mem_percent = parse_optional_f64(fields[4]);
+
+    Some((
+        pid,
+        GpuProcessInfo {
+            gpu_percent,
+            gpu_mem_percent,
+            gpu_memory_mb: None,
+        },
+    ))
+}
+
+fn get_nvidia_compute_process_info() -> HashMap<u32, GpuProcessInfo> {
+    let output = match run_nvidia_smi(&[
+        "--query-compute-apps=pid,used_memory",
+        "--format=csv,noheader,nounits",
+    ]) {
+        Ok(output) if output.status.success() => output,
+        _ => return HashMap::new(),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .filter_map(parse_nvidia_compute_process_line)
+        .collect()
+}
+
+fn parse_nvidia_compute_process_line(line: &str) -> Option<(u32, GpuProcessInfo)> {
+    let fields: Vec<_> = line.split(',').map(str::trim).collect();
+    if fields.len() < 2 {
+        return None;
+    }
+
+    Some((
+        fields[0].parse().ok()?,
+        GpuProcessInfo {
+            gpu_percent: None,
+            gpu_mem_percent: None,
+            gpu_memory_mb: parse_optional_u64(fields[1]),
+        },
+    ))
+}
+
+fn run_nvidia_smi(args: &[&str]) -> io::Result<std::process::Output> {
+    let mut last_error = None;
+    for command in nvidia_smi_candidates() {
+        match Command::new(&command).args(args).output() {
+            Ok(output) => return Ok(output),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "nvidia-smi was not found")))
+}
+
+fn nvidia_smi_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![PathBuf::from("nvidia-smi")];
+    if let Some(program_files) = env::var_os("ProgramFiles") {
+        candidates.push(
+            Path::new(&program_files)
+                .join("NVIDIA Corporation")
+                .join("NVSMI")
+                .join("nvidia-smi.exe"),
+        );
+    }
+    candidates.push(PathBuf::from(
+        r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
+    ));
+    candidates.push(PathBuf::from(r"C:\Windows\System32\nvidia-smi.exe"));
+    candidates
+}
+
+fn parse_nvidia_smi_gpu_line(line: &str) -> Option<GpuInfo> {
+    let fields: Vec<_> = line.split(',').map(str::trim).collect();
+    if fields.len() < 5 || fields[0].is_empty() {
+        return None;
+    }
+
+    Some(GpuInfo {
+        name: fields[0].to_string(),
+        utilization_percent: parse_optional_f64(fields[1]),
+        memory_total_mb: parse_optional_u64(fields[2]),
+        memory_used_mb: parse_optional_u64(fields[3]),
+        temperature_c: parse_optional_u32(fields[4]),
+    })
+}
+
+fn parse_optional_f64(value: &str) -> Option<f64> {
+    if value.eq_ignore_ascii_case("[not supported]") || value.eq_ignore_ascii_case("N/A") {
+        None
+    } else {
+        value.parse().ok()
+    }
+}
+
+fn parse_optional_u64(value: &str) -> Option<u64> {
+    if value.eq_ignore_ascii_case("[not supported]") || value.eq_ignore_ascii_case("N/A") {
+        None
+    } else {
+        value.parse().ok()
+    }
+}
+
+fn parse_optional_u32(value: &str) -> Option<u32> {
+    if value.eq_ignore_ascii_case("[not supported]") || value.eq_ignore_ascii_case("N/A") {
+        None
+    } else {
+        value.parse().ok()
+    }
 }
 
 fn get_cpu_times() -> CpuTimes {
@@ -739,7 +1083,11 @@ fn get_memory_info() -> (u64, u64, u64, u64) {
     }
 }
 
-fn get_processes(prev_times: &HashMap<u32, (u64, u64, Instant)>, now: Instant) -> Vec<ProcessInfo> {
+fn get_processes(
+    prev_times: &HashMap<u32, (u64, u64, Instant)>,
+    gpu_processes: &HashMap<u32, GpuProcessInfo>,
+    now: Instant,
+) -> Vec<ProcessInfo> {
     let mut processes = Vec::new();
     let (mem_total, _, _, _) = get_memory_info();
 
@@ -765,6 +1113,7 @@ fn get_processes(prev_times: &HashMap<u32, (u64, u64, Instant)>, now: Instant) -
                 .to_string();
 
                 let details = get_process_details(entry.th32ProcessID, mem_total, prev_times, now);
+                let gpu_info = gpu_processes.get(&entry.th32ProcessID);
 
                 processes.push(ProcessInfo {
                     pid: entry.th32ProcessID,
@@ -776,6 +1125,9 @@ fn get_processes(prev_times: &HashMap<u32, (u64, u64, Instant)>, now: Instant) -
                     memory_vsz: details.vsz,
                     cpu_percent: details.cpu_percent,
                     mem_percent: details.mem_percent,
+                    gpu_percent: gpu_info.and_then(|info| info.gpu_percent),
+                    gpu_mem_percent: gpu_info.and_then(|info| info.gpu_mem_percent),
+                    gpu_memory_mb: gpu_info.and_then(|info| info.gpu_memory_mb),
                     cpu_time: details.cpu_time,
                     status: details.status,
                     kernel_time: details.kernel_time,
@@ -995,21 +1347,24 @@ fn draw(state: &TopState, stdout: &mut io::Stdout) -> io::Result<()> {
         return Ok(());
     }
 
-    // システム情報ヘッダー（5行）
-    draw_header(stdout, &state.system)?;
+    let header_height = header_height(&state.system);
+
+    // システム情報ヘッダー
+    draw_header(stdout, &state.system, cols)?;
 
     // カラムヘッダー（1行）
-    draw_column_header(stdout, state.sort_key, cols)?;
+    draw_column_header(stdout, state.sort_key, cols, header_height)?;
 
     // プロセス一覧
-    let visible_rows = (rows as usize).saturating_sub(8);
+    let process_start_row = header_height + 1;
+    let visible_rows = (rows as usize).saturating_sub(process_start_row as usize + 1);
     let end_index = (state.scroll_offset + visible_rows).min(state.processes.len());
 
     for (i, proc) in state.processes[state.scroll_offset..end_index]
         .iter()
         .enumerate()
     {
-        let row = 7 + i as u16;
+        let row = process_start_row + i as u16;
         let is_selected = state.scroll_offset + i == state.selected_index;
 
         execute!(stdout, MoveTo(0, row))?;
@@ -1023,18 +1378,20 @@ fn draw(state: &TopState, stdout: &mut io::Stdout) -> io::Result<()> {
         }
 
         let line = format!(
-            "{:>7} {:<10} {:>3} {:>5.1} {:>5.1} {:>9} {:>9} {:>1} {:>4} {:>9} {}",
+            "{:>7} {:<10} {:>3} {:>5.1} {:>5.1} {:>5} {:>5} {:>9} {:>9} {:>1} {:>4} {:>9} {}",
             proc.pid,
             truncate_str(&proc.user, 10),
             proc.priority,
             proc.cpu_percent,
             proc.mem_percent,
+            format_optional_percent(proc.gpu_percent),
+            format_gpu_memory(proc.gpu_mem_percent, proc.gpu_memory_mb),
             format_kb(proc.memory_vsz),
             format_kb(proc.memory_rss),
             proc.status,
             proc.threads,
             format_time(proc.cpu_time),
-            truncate_str(&proc.name, cols as usize - 75)
+            truncate_str(&proc.name, (cols as usize).saturating_sub(87))
         );
 
         execute!(
@@ -1063,7 +1420,11 @@ fn draw(state: &TopState, stdout: &mut io::Stdout) -> io::Result<()> {
     Ok(())
 }
 
-fn draw_header(stdout: &mut io::Stdout, sys: &SystemInfo) -> io::Result<()> {
+fn header_height(sys: &SystemInfo) -> u16 {
+    6 + sys.gpus.len() as u16 + sys.vulkan.as_ref().map(vulkan_line_count).unwrap_or(0) as u16
+}
+
+fn draw_header(stdout: &mut io::Stdout, sys: &SystemInfo, cols: u16) -> io::Result<()> {
     let uptime = format_uptime(sys.uptime_secs);
 
     // 1行目: top情報
@@ -1124,22 +1485,45 @@ fn draw_header(stdout: &mut io::Stdout, sys: &SystemInfo) -> io::Result<()> {
         ))
     )?;
 
+    for (i, gpu) in sys.gpus.iter().enumerate() {
+        execute!(
+            stdout,
+            MoveTo(0, 5 + i as u16),
+            Print(truncate_str(&format_gpu_line(gpu), cols as usize))
+        )?;
+    }
+
+    if let Some(vulkan) = &sys.vulkan {
+        for (i, line) in format_vulkan_lines(vulkan).iter().enumerate() {
+            execute!(
+                stdout,
+                MoveTo(0, 5 + sys.gpus.len() as u16 + i as u16),
+                Print(truncate_str(line, cols as usize))
+            )?;
+        }
+    }
+
     // 空行
-    execute!(stdout, MoveTo(0, 5), Print(""))?;
+    execute!(stdout, MoveTo(0, header_height(sys) - 1), Print(""))?;
 
     Ok(())
 }
 
-fn draw_column_header(stdout: &mut io::Stdout, sort_key: SortKey, cols: u16) -> io::Result<()> {
+fn draw_column_header(
+    stdout: &mut io::Stdout,
+    sort_key: SortKey,
+    cols: u16,
+    row: u16,
+) -> io::Result<()> {
     execute!(
         stdout,
-        MoveTo(0, 6),
+        MoveTo(0, row),
         SetBackgroundColor(Color::Green),
         SetForegroundColor(Color::Black)
     )?;
 
     let header = format!(
-        "{:>7} {:<10} {:>3} {:>5} {:>5} {:>9} {:>9} {:>1} {:>4} {:>9} {}",
+        "{:>7} {:<10} {:>3} {:>5} {:>5} {:>5} {:>5} {:>9} {:>9} {:>1} {:>4} {:>9} {}",
         "PID",
         if sort_key == SortKey::User {
             "USER*"
@@ -1157,6 +1541,8 @@ fn draw_column_header(stdout: &mut io::Stdout, sort_key: SortKey, cols: u16) -> 
         } else {
             "%MEM"
         },
+        "%GPU",
+        "GMEM",
         "VSZ",
         if sort_key == SortKey::Res {
             "RSS*"
@@ -1205,6 +1591,11 @@ fn draw_help(stdout: &mut io::Stdout) -> io::Result<()> {
         "  d, s            更新間隔変更",
         "  u, U            ユーザーフィルタ (* ? [] 対応, 大文字小文字無視)",
         "  h, ?, F1        このヘルプ",
+        "",
+        "GPU:",
+        "  nvidia-smi が利用できる環境では使用率、VRAM、温度をヘッダーに表示",
+        "  nvidia-smi pmon が利用できる環境ではプロセス別GPU使用率を表示",
+        "  vulkaninfo が利用できる環境では Vulkan デバイス詳細もヘッダーに表示",
         "",
         "何かキーを押すと戻ります...",
     ];
@@ -1435,11 +1826,106 @@ fn format_mib(kb: u64) -> String {
     format!("{:.1}", kb as f64 / 1024.0)
 }
 
+fn format_optional_percent(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{:.0}", value))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_gpu_memory(percent: Option<f64>, memory_mb: Option<u64>) -> String {
+    if let Some(percent) = percent {
+        format!("{:.0}", percent)
+    } else if let Some(memory_mb) = memory_mb {
+        if memory_mb >= 1024 {
+            format!("{:.1}G", memory_mb as f64 / 1024.0)
+        } else {
+            format!("{}M", memory_mb)
+        }
+    } else {
+        "-".to_string()
+    }
+}
+
+fn format_gpu_line(gpu: &GpuInfo) -> String {
+    let utilization = gpu
+        .utilization_percent
+        .map(|value| format!("{:>5.1}%", value))
+        .unwrap_or_else(|| "  N/A ".to_string());
+    let memory = match (gpu.memory_used_mb, gpu.memory_total_mb) {
+        (Some(used), Some(total)) => format!("{}/{} MiB", used, total),
+        _ => "N/A".to_string(),
+    };
+    let temperature = gpu
+        .temperature_c
+        .map(|value| format!("{} C", value))
+        .unwrap_or_else(|| "N/A".to_string());
+
+    format!(
+        "%Gpu: {}  util {}, mem {}, temp {}",
+        gpu.name, utilization, memory, temperature
+    )
+}
+
+fn vulkan_line_count(vulkan: &VulkanInfo) -> usize {
+    1 + vulkan.devices.len()
+}
+
+fn format_vulkan_lines(vulkan: &VulkanInfo) -> Vec<String> {
+    let mut lines = Vec::with_capacity(vulkan_line_count(vulkan));
+    if vulkan.devices.is_empty() {
+        lines.push(format!("Vulkan: API {}", vulkan.api_version));
+        return lines;
+    }
+
+    lines.push(format!(
+        "Vulkan: API {}, {} device(s)",
+        vulkan.api_version,
+        vulkan.devices.len()
+    ));
+    for device in &vulkan.devices {
+        lines.push(format_vulkan_device_line(device));
+    }
+    lines
+}
+
+fn format_vulkan_device_line(device: &VulkanDeviceInfo) -> String {
+    let name = device.name.as_deref().unwrap_or("unknown");
+    let device_type = device.device_type.as_deref().unwrap_or("unknown");
+    let api_version = device.api_version.as_deref().unwrap_or("N/A");
+    let driver = match (device.driver_name.as_deref(), device.driver_info.as_deref()) {
+        (Some(name), Some(info)) => format!("{} {}", name, info),
+        (Some(name), None) => name.to_string(),
+        (None, Some(info)) => info.to_string(),
+        (None, None) => "N/A".to_string(),
+    };
+
+    format!(
+        "%Vk{}: {}, {}, API {}, driver {}",
+        device.index, name, device_type, api_version, driver
+    )
+}
+
 fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         s.to_string()
     } else {
-        s[..max_len].to_string()
+        s.chars().take(max_len).collect()
+    }
+}
+
+impl VulkanVersion {
+    fn from_raw(version: u32) -> Self {
+        Self {
+            major: version >> 22,
+            minor: (version >> 12) & 0x3ff,
+            patch: version & 0xfff,
+        }
+    }
+}
+
+impl std::fmt::Display for VulkanVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
     }
 }
 
@@ -1617,13 +2103,20 @@ impl Default for SystemInfo {
             swap_total: 0,
             swap_used: 0,
             swap_free: 0,
+            gpus: Vec::new(),
+            vulkan: None,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{has_glob_metachar, matches_filter_pattern, matches_posix_glob_case_insensitive};
+    use super::{
+        format_gpu_line, format_gpu_memory, format_optional_percent, format_vulkan_lines,
+        has_glob_metachar, matches_filter_pattern, matches_posix_glob_case_insensitive,
+        parse_nvidia_pmon_process_line, parse_nvidia_smi_gpu_line, parse_vulkaninfo_summary,
+        GpuInfo, VulkanInfo, VulkanVersion,
+    };
 
     #[test]
     fn plain_filter_remains_case_insensitive_substring() {
@@ -1658,5 +2151,121 @@ mod tests {
         assert!(has_glob_metachar("adm*"));
         assert!(has_glob_metachar("user[0-9]"));
         assert!(!has_glob_metachar(r"user\*literal"));
+    }
+
+    #[test]
+    fn nvidia_smi_gpu_line_is_parsed() {
+        let gpu = parse_nvidia_smi_gpu_line("NVIDIA GeForce RTX 4070, 12, 12282, 2048, 54")
+            .expect("GPU line should parse");
+
+        assert_eq!(gpu.name, "NVIDIA GeForce RTX 4070");
+        assert_eq!(gpu.utilization_percent, Some(12.0));
+        assert_eq!(gpu.memory_total_mb, Some(12282));
+        assert_eq!(gpu.memory_used_mb, Some(2048));
+        assert_eq!(gpu.temperature_c, Some(54));
+    }
+
+    #[test]
+    fn gpu_line_formats_missing_values_as_na() {
+        let line = format_gpu_line(&GpuInfo {
+            name: "GPU 0".to_string(),
+            utilization_percent: None,
+            memory_total_mb: None,
+            memory_used_mb: None,
+            temperature_c: None,
+        });
+
+        assert_eq!(line, "%Gpu: GPU 0  util   N/A , mem N/A, temp N/A");
+    }
+
+    #[test]
+    fn nvidia_pmon_process_line_is_parsed() {
+        let (pid, info) = parse_nvidia_pmon_process_line(
+            "    0   29916     C    37    11     -     -  ollama.exe",
+        )
+        .expect("pmon process line should parse");
+
+        assert_eq!(pid, 29916);
+        assert_eq!(info.gpu_percent, Some(37.0));
+        assert_eq!(info.gpu_mem_percent, Some(11.0));
+    }
+
+    #[test]
+    fn gpu_process_formatters_use_dash_for_missing_values() {
+        assert_eq!(format_optional_percent(None), "-");
+        assert_eq!(format_optional_percent(Some(42.0)), "42");
+        assert_eq!(format_gpu_memory(None, None), "-");
+        assert_eq!(format_gpu_memory(None, Some(1536)), "1.5G");
+        assert_eq!(format_gpu_memory(Some(8.0), Some(1536)), "8");
+    }
+
+    #[test]
+    fn vulkan_version_is_decoded_from_raw_api_version() {
+        let raw = (1 << 22) | (3 << 12) | 275;
+        assert_eq!(
+            VulkanVersion::from_raw(raw),
+            VulkanVersion {
+                major: 1,
+                minor: 3,
+                patch: 275
+            }
+        );
+        assert_eq!(VulkanVersion::from_raw(raw).to_string(), "1.3.275");
+    }
+
+    #[test]
+    fn vulkaninfo_summary_devices_are_parsed() {
+        let devices = parse_vulkaninfo_summary(
+            r#"Vulkan Instance Version: 1.4.341
+
+Devices:
+========
+GPU0:
+    apiVersion         = 1.4.329
+    deviceType         = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+    deviceName         = NVIDIA GeForce RTX 5070
+    driverName         = NVIDIA
+    driverInfo         = 595.79
+GPU1:
+    apiVersion         = 1.4.315
+    deviceType         = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+    deviceName         = AMD Radeon(TM) Graphics
+    driverName         = AMD proprietary driver
+"#,
+        );
+
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].index, 0);
+        assert_eq!(devices[0].name.as_deref(), Some("NVIDIA GeForce RTX 5070"));
+        assert_eq!(devices[0].device_type.as_deref(), Some("discrete gpu"));
+        assert_eq!(devices[0].driver_info.as_deref(), Some("595.79"));
+        assert_eq!(devices[1].index, 1);
+        assert_eq!(devices[1].device_type.as_deref(), Some("integrated gpu"));
+    }
+
+    #[test]
+    fn vulkan_lines_include_device_details_when_present() {
+        let lines = format_vulkan_lines(&VulkanInfo {
+            api_version: VulkanVersion {
+                major: 1,
+                minor: 4,
+                patch: 341,
+            },
+            devices: parse_vulkaninfo_summary(
+                r#"GPU0:
+    apiVersion = 1.4.329
+    deviceType = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+    deviceName = NVIDIA GeForce RTX 5070
+    driverName = NVIDIA
+    driverInfo = 595.79
+"#,
+            ),
+        });
+
+        assert_eq!(lines[0], "Vulkan: API 1.4.341, 1 device(s)");
+        assert_eq!(
+            lines[1],
+            "%Vk0: NVIDIA GeForce RTX 5070, discrete gpu, API 1.4.329, driver NVIDIA 595.79"
+        );
     }
 }

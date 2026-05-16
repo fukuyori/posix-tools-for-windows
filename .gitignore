@@ -1,6 +1,7 @@
 **/target/
 **/target_verify/
 **/target-posix/
+dist/
 cat/.tmp_test/
 cp/tmp/
 *.zip

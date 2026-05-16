@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmd /c \"dir D:\\\\home\\\\source\\\\rust\\\\tools\\\\awk /b\")",
+      "Bash('D:/home/source/rust/tools/awk/target/release/awk.exe' 'NR==1 && /^#!/ {next} /^#/ {print}')",
+      "Bash('D:/home/source/rust/tools/sed/target/release/sed.exe' -n -e '/^#/{s/^# *//;p}')",
+      "Bash('D:/home/source/rust/tools/sed/target/release/sed.exe' -n -e '/^#!/d' -e '/^#/{s/^# *//;p}' -e '/^[^#]/q')",
+      "Bash('D:/home/source/rust/tools/sed/target/release/sed.exe' -n -e '/^#!/d' -e '/^#/p')",
+      "Bash('D:/home/source/rust/tools/sed/target/release/sed.exe' -n -e '/^foo/d' -e '/^#/p')",
+      "Bash(./target/release/awk.exe 'NR==1 && /^#!/ {next} /^#/ {print}')",
+      "Bash('D:/home/source/rust/tools/sed/target/release/sed.exe' -n -e '/^h/p')",
+      "Bash(MSYS_NO_PATHCONV=1 'D:/home/source/rust/tools/sed/target/release/sed.exe' -n -e '/^h/p' -e 'zzz')",
+      "Bash(MSYS_NO_PATHCONV=1 'D:/home/source/rust/tools/sed/target/release/sed.exe' -n -e '/abc/p' -e 'WOOPS')",
+      "Bash(MSYS_NO_PATHCONV=1 'D:/home/source/rust/tools/sed/target/release/sed.exe' -n -e '/^#!/d' -e '/^#/{s/^# *//;p}' -e '/^[^#]/q')",
+      "Bash('D:/home/source/rust/tools/sed/target/release/sed.exe' -e '/abc/d' -e 'WOOPS')",
+      "Bash('D:/home/source/rust/tools/sed/target/release/sed.exe' -n '/^h/p')",
+      "Bash(./target/release/awk.exe --version)",
+      "Bash(./target/release/sed.exe --version)",
+      "Bash(git -C 'D:/home/source/rust/tools' add awk/Cargo.toml awk/Cargo.lock awk/src/lexer.rs awk/src/main.rs)",
+      "Bash(git -C D:/home/source/rust/tools commit -m ' *)",
+      "Bash(git -C 'D:/home/source/rust/tools' add sed/Cargo.toml sed/Cargo.lock sed/src/main.rs sed/tests/cli.rs sed/README.md)",
+      "Bash(git -C 'D:/home/source/rust/tools' log --oneline -4)",
+      "Bash(git -C 'D:/home/source/rust/tools' status -s)"
+    ]
+  }
+}
