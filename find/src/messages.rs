@@ -13,21 +13,29 @@ Windows 指向の find コマンド（Rust 実装、POSIX 互換）
   -H                  コマンドライン引数のシンボリックリンクを辿る
   -L                  全てのシンボリックリンクを辿る
   -P                  シンボリックリンクを辿らない（デフォルト）
+  -follow             -L と同じ（非推奨の別名）
   -maxdepth <レベル>  最大検索深度を指定
   -mindepth <レベル>  最小検索深度を指定
   -depth              深さ優先で処理（ディレクトリの前に内容を処理）
+  -daystart           時間テストを「今日の始まり」を基準に測る
   -xdev               他のファイルシステムに入らない
   -mount              -xdev と同じ
+  -regextype <タイプ> -regex/-iregex の正規表現方言を指定
+                        emacs, posix-basic (ed/sed/grep),
+                        posix-extended (デフォルト、egrep/awk 等)
 
 テスト（条件式）:
   -name <パターン>    ファイル名がパターンにマッチ（glob形式）
   -iname <パターン>   大文字小文字を区別せずにファイル名がマッチ
   -path <パターン>    パス全体がパターンにマッチ
   -ipath <パターン>   大文字小文字を区別せずにパスがマッチ
-  -regex <正規表現>   パスが正規表現にマッチ
+  -lname <パターン>   シンボリックリンクの内容がパターンにマッチ
+  -ilname <パターン>  大文字小文字を区別せずにリンク内容がマッチ
+  -regex <正規表現>   パス全体が正規表現にマッチ
   -iregex <正規表現>  大文字小文字を区別せず正規表現にマッチ
 
-  -type <タイプ>      ファイルタイプで検索
+  -type <タイプ>      ファイルタイプで検索（f,d のようにカンマ区切りで OR 可）
+  -xtype <タイプ>     -type と同様だがシンボリックリンクの解決が逆
                         b: ブロックデバイス
                         c: キャラクタデバイス
                         d: ディレクトリ
@@ -46,8 +54,12 @@ Windows 指向の find コマンド（Rust 実装、POSIX 互換）
                       +n: nより大きい, -n: nより小さい, n: ちょうどn
 
   -empty              空のファイルまたはディレクトリ
-  -newer <ファイル>   指定ファイルより新しい
-  -newerXY <参照>     タイムスタンプ比較（X,Y: a=atime, c=ctime, m=mtime, t=絶対時間）
+  -newer <ファイル>   指定ファイルより新しい（mtime 比較）
+  -anewer <ファイル>  atime が指定ファイルの mtime より新しい
+  -cnewer <ファイル>  ctime が指定ファイルの mtime より新しい
+  -newerXY <参照>     タイムスタンプ比較
+                        X,Y: a=atime, c=ctime, m=mtime, B=作成時刻, t=絶対時間
+                        （例: -newermt "2026-01-01", -newermt "@1750000000"）
 
   -atime <n>          アクセス時刻（日単位）
   -ctime <n>          ステータス変更時刻（日単位）
@@ -55,6 +67,7 @@ Windows 指向の find コマンド（Rust 実装、POSIX 互換）
   -amin <n>           アクセス時刻（分単位）
   -cmin <n>           ステータス変更時刻（分単位）
   -mmin <n>           修正時刻（分単位）
+  -used <n>           最終アクセスがステータス変更の n 日後
 
   -user <名前/ID>     所有者で検索
   -group <名前/ID>    グループで検索
@@ -75,6 +88,7 @@ Windows 指向の find コマンド（Rust 実装、POSIX 互換）
   -links <n>          ハードリンク数で検索
   -inum <n>           inode番号で検索
   -samefile <ファイル> 同じinodeを持つファイル
+  -fstype <タイプ>    ファイルシステムのタイプで検索（例: NTFS, ext4）
 
   -true               常に真
   -false              常に偽
@@ -86,7 +100,8 @@ Windows 指向の find コマンド（Rust 実装、POSIX 互換）
   -fprint0 <ファイル> NULLで区切ってファイルに出力
 
   -printf <フォーマット>  フォーマット指定で出力
-    ディレクティブ:
+  -fprintf <ファイル> <フォーマット>  フォーマット指定でファイルに出力
+    ディレクティブ（%-8s のようなフラグ・幅指定も可）:
       %%  リテラル %
       %p  ファイル名（パス）
       %f  ベース名
@@ -97,6 +112,9 @@ Windows 指向の find コマンド（Rust 実装、POSIX 互換）
       %s  サイズ（バイト）
       %k  サイズ（キビバイト）
       %b  512バイトブロック数
+      %S  スパース度（blocks*512/size）
+      %D  デバイス番号
+      %F  ファイルシステムのタイプ
       %m  パーミッション（8進数）
       %M  パーミッション（記号形式）
       %u  ユーザー名
@@ -114,9 +132,12 @@ Windows 指向の find コマンド（Rust 実装、POSIX 互換）
       %C<フォーマット>  ステータス変更時刻（strftime形式）
       %t  修正時刻
       %T<フォーマット>  修正時刻（strftime形式）
+      %B<フォーマット>  作成時刻（strftime形式）
+      （時刻フォーマット '@' はエポック秒、'+' は日付+時刻）
       \n  改行
       \t  タブ
-      \0  NULL
+      \0  NULL（\NNN 8進エスケープ、\a \b \f \r \v も可）
+      \c  出力をここで打ち切る
 
   -ls                 ls -dils 形式で表示
   -fls <ファイル>     ls形式でファイルに出力
@@ -159,7 +180,7 @@ Windows 指向の find コマンド（Rust 実装、POSIX 互換）
   0  全て成功
   1  エラー発生
 
-バージョン: 1.0.0
+バージョン: 1.1.0
 "#;
 
 // エラーメッセージ
@@ -263,4 +284,30 @@ pub fn err_exec_batch_partial_placeholder(arg: &str) -> String {
         "エラー: '-exec ... {{}} +' では {{}} は単独トークンである必要がありますが '{}' が指定されました",
         arg
     )
+}
+
+pub fn err_invalid_regextype(name: &str) -> String {
+    format!(
+        "エラー: 不明な正規表現タイプ '{}' (有効: emacs, findutils-default, ed, sed, grep, \
+         posix-basic, posix-minimal-basic, posix-extended, posix-egrep, egrep, posix-awk, awk, gnu-awk)",
+        name
+    )
+}
+
+pub fn err_birth_time_unsupported(file: &str) -> String {
+    format!(
+        "エラー: '{}' の作成時刻（birth time）を取得できません",
+        file
+    )
+}
+
+pub fn warn_symlink_loop(path: &str) -> String {
+    format!(
+        "警告: '{}' はシンボリックリンクの循環を形成しているため、これ以上辿りません",
+        path
+    )
+}
+
+pub fn err_delete_current_dir() -> String {
+    "エラー: '.' は削除できません".to_string()
 }

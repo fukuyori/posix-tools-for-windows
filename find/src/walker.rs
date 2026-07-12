@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -17,6 +16,9 @@ pub struct Walker {
     pub batch_executor: BatchExecutor,
     pub use_default_print: bool,
     pub exit_code: i32,
+    now: SystemTime,
+    /// -daystart 用の「今日の終わり（明日 00:00）」
+    day_end: SystemTime,
 }
 
 impl Walker {
@@ -26,6 +28,7 @@ impl Walker {
             .map(|e| !Self::contains_non_default_action(e))
             .unwrap_or(true);
 
+        let now = SystemTime::now();
         Walker {
             options,
             expression,
@@ -33,6 +36,8 @@ impl Walker {
             batch_executor: BatchExecutor::new(),
             use_default_print,
             exit_code: 0,
+            now,
+            day_end: now,
         }
     }
 
@@ -48,10 +53,16 @@ impl Walker {
     }
 
     pub fn walk(&mut self, start_paths: &[PathBuf]) {
-        let now = SystemTime::now();
+        self.now = SystemTime::now();
+        self.day_end = compute_day_end().unwrap_or(self.now);
 
-        for start_path in start_paths {
-            if !start_path.exists() {
+        // 式ツリーはファイルごとに clone せず、走査中は take して参照で渡す
+        let expression = self.expression.take();
+
+        'paths: for start_path in start_paths {
+            // exists() はリンクを辿るため、リンク切れの開始パスも扱えるよう
+            // symlink_metadata で存在確認する
+            if fs::symlink_metadata(start_path).is_err() {
                 eprintln!(
                     "{}",
                     messages::err_path_not_found(&start_path.display().to_string())
@@ -60,126 +71,46 @@ impl Walker {
                 continue;
             }
 
-            let result: Result<(), String> = if self.options.depth_first {
-                self.walk_depth_first(start_path, start_path, 0, now)
-                    .map(|_| ())
+            let start_dev = if self.options.xdev {
+                fs::metadata(start_path)
+                    .map(|m| platform::get_dev(&m))
+                    .ok()
             } else {
-                self.walk_breadth_first(start_path, now)
+                None
             };
 
-            if let Err(e) = result {
-                eprintln!("{}", e);
-                self.exit_code = 1;
+            // -L でのシンボリックリンク循環検出用（走査中の祖先ディレクトリの実体パス）
+            let mut ancestors: Vec<PathBuf> = Vec::new();
+
+            match self.visit(start_path, start_path, 0, start_dev, &expression, &mut ancestors) {
+                Ok(true) => break 'paths, // -quit は全体を停止する
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("{}", e);
+                    self.exit_code = 1;
+                }
             }
         }
 
+        self.expression = expression;
+
         self.batch_executor.flush();
+        if self.batch_executor.had_failure() {
+            self.exit_code = 1;
+        }
         self.output_manager.flush_all();
     }
 
-    fn walk_breadth_first(&mut self, start: &Path, now: SystemTime) -> Result<(), String> {
-        struct Entry {
-            path: PathBuf,
-            depth: usize,
-        }
-
-        let start_dev = fs::metadata(start).map(|m| platform::get_dev(&m)).ok();
-        let mut queue: VecDeque<Entry> = VecDeque::new();
-        queue.push_back(Entry {
-            path: start.to_path_buf(),
-            depth: 0,
-        });
-
-        while let Some(entry) = queue.pop_front() {
-            if let Some(max) = self.options.max_depth {
-                if entry.depth > max {
-                    continue;
-                }
-            }
-
-            let (metadata, symlink_metadata) =
-                match self.get_metadata(&entry.path, entry.depth == 0) {
-                    Some(m) => m,
-                    None => {
-                        self.exit_code = 1;
-                        continue;
-                    }
-                };
-
-            if self.options.xdev && start_dev.is_some() {
-                if platform::get_dev(&metadata) != start_dev.unwrap() {
-                    continue;
-                }
-            }
-
-            // is_dir の判定はウォーカー自身が必要なので metadata を使う
-            let is_dir = metadata.is_dir();
-
-            let (_matched, should_prune, should_quit) = self.evaluate_and_execute(
-                &entry.path,
-                if symlink_metadata.is_some() {
-                    symlink_metadata.as_ref().unwrap().clone()
-                } else {
-                    metadata.clone()
-                },
-                if symlink_metadata.is_some() {
-                    Some(metadata)
-                } else {
-                    None
-                },
-                start,
-                entry.depth,
-                now,
-            )?;
-
-            if should_quit {
-                return Ok(());
-            }
-
-            if is_dir && !should_prune {
-                let should_descend = match self.options.max_depth {
-                    Some(max) => entry.depth < max,
-                    None => true,
-                };
-
-                if should_descend {
-                    match fs::read_dir(&entry.path) {
-                        Ok(read_dir) => {
-                            for dir_entry in read_dir.flatten() {
-                                queue.push_back(Entry {
-                                    path: dir_entry.path(),
-                                    depth: entry.depth + 1,
-                                });
-                            }
-                        }
-                        Err(_e) => {
-                            eprintln!(
-                                "{}",
-                                messages::warn_cannot_read_dir(&entry.path.display().to_string())
-                            );
-                            self.exit_code = 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn walk_depth_first(
+    /// 1エントリを訪問する。戻り値は「-quit したかどうか」。
+    fn visit(
         &mut self,
         path: &Path,
         start: &Path,
         depth: usize,
-        now: SystemTime,
+        start_dev: Option<u64>,
+        expression: &Option<Expression>,
+        ancestors: &mut Vec<PathBuf>,
     ) -> Result<bool, String> {
-        if let Some(max) = self.options.max_depth {
-            if depth > max {
-                return Ok(false);
-            }
-        }
-
         let (metadata, symlink_metadata) = match self.get_metadata(path, depth == 0) {
             Some(m) => m,
             None => {
@@ -188,28 +119,73 @@ impl Walker {
             }
         };
 
-        let start_dev = fs::metadata(start).map(|m| platform::get_dev(&m)).ok();
-        if self.options.xdev && start_dev.is_some() {
-            if platform::get_dev(&metadata) != start_dev.unwrap() {
-                return Ok(false);
+        let is_dir = metadata.is_dir();
+        // -xdev: 別ファイルシステムのエントリ自体は評価するが、その中には入らない
+        let same_dev = start_dev.map_or(true, |dev| platform::get_dev(&metadata) == dev);
+
+        let mut should_prune = false;
+
+        if !self.options.depth_first {
+            let (_matched, prune, quit) = self.evaluate_and_execute(
+                path,
+                depth,
+                start,
+                expression,
+                &metadata,
+                symlink_metadata.as_ref(),
+            )?;
+            if quit {
+                return Ok(true);
             }
+            should_prune = prune;
         }
 
-        let is_dir = metadata.is_dir();
+        let should_descend = is_dir
+            && !should_prune
+            && same_dev
+            && self.options.max_depth.map_or(true, |max| depth < max);
 
-        if is_dir {
-            let should_descend = match self.options.max_depth {
-                Some(max) => depth < max,
-                None => true,
-            };
+        if should_descend {
+            // シンボリックリンクを辿ってディレクトリに入る場合は循環を検出する。
+            // -L では実ディレクトリも祖先として記録し、循環を最初のリンクで検出する。
+            let mut pushed_ancestor = false;
+            let mut skip_descend = false;
+            if symlink_metadata.is_some()
+                || matches!(self.options.follow_symlinks, FollowSymlinks::Always)
+            {
+                match fs::canonicalize(path) {
+                    Ok(canonical) => {
+                        if ancestors.contains(&canonical) {
+                            eprintln!(
+                                "{}",
+                                messages::warn_symlink_loop(&path.display().to_string())
+                            );
+                            skip_descend = true;
+                        } else {
+                            ancestors.push(canonical);
+                            pushed_ancestor = true;
+                        }
+                    }
+                    Err(_) => skip_descend = true,
+                }
+            }
 
-            if should_descend {
+            if !skip_descend {
                 match fs::read_dir(path) {
                     Ok(read_dir) => {
                         for dir_entry in read_dir.flatten() {
-                            let quit =
-                                self.walk_depth_first(&dir_entry.path(), start, depth + 1, now)?;
+                            let quit = self.visit(
+                                &dir_entry.path(),
+                                start,
+                                depth + 1,
+                                start_dev,
+                                expression,
+                                ancestors,
+                            )?;
                             if quit {
+                                if pushed_ancestor {
+                                    ancestors.pop();
+                                }
                                 return Ok(true);
                             }
                         }
@@ -223,26 +199,27 @@ impl Walker {
                     }
                 }
             }
+
+            if pushed_ancestor {
+                ancestors.pop();
+            }
         }
 
-        let (_, _, should_quit) = self.evaluate_and_execute(
-            path,
-            if symlink_metadata.is_some() {
-                symlink_metadata.as_ref().unwrap().clone()
-            } else {
-                metadata.clone()
-            },
-            if symlink_metadata.is_some() {
-                Some(metadata)
-            } else {
-                None
-            },
-            start,
-            depth,
-            now,
-        )?;
+        if self.options.depth_first {
+            let (_matched, _prune, quit) = self.evaluate_and_execute(
+                path,
+                depth,
+                start,
+                expression,
+                &metadata,
+                symlink_metadata.as_ref(),
+            )?;
+            if quit {
+                return Ok(true);
+            }
+        }
 
-        Ok(should_quit)
+        Ok(false)
     }
 
     fn get_metadata(
@@ -288,11 +265,11 @@ impl Walker {
     fn evaluate_and_execute(
         &mut self,
         path: &Path,
-        symlink_meta: Metadata,
-        followed_meta: Option<Metadata>,
-        start: &Path,
         depth: usize,
-        now: SystemTime,
+        start: &Path,
+        expression: &Option<Expression>,
+        metadata: &Metadata,
+        symlink_metadata: Option<&Metadata>,
     ) -> Result<(bool, bool, bool), String> {
         if let Some(min) = self.options.min_depth {
             if depth < min {
@@ -300,20 +277,24 @@ impl Walker {
             }
         }
 
-        let follow_symlinks = matches!(self.options.follow_symlinks, FollowSymlinks::Always);
-        let eval_ctx = EvalContext::new(
+        let follow_symlinks = should_follow_metadata(self.options.follow_symlinks, depth == 0);
+        let (symlink_meta, followed_meta) = if let Some(sm) = symlink_metadata {
+            (sm.clone(), Some(metadata.clone()))
+        } else {
+            (metadata.clone(), None)
+        };
+        let mut eval_ctx = EvalContext::new(
             path,
             start,
             depth,
-            now,
+            self.now,
             symlink_meta,
             followed_meta,
             follow_symlinks,
         );
+        eval_ctx.day_end = self.day_end;
 
-        // Clone the expression to avoid borrowing issues
-        let expr_opt = self.expression.clone();
-        let (matched, should_prune, should_quit) = if let Some(ref expr) = expr_opt {
+        let (matched, should_prune, should_quit) = if let Some(expr) = expression {
             self.evaluate_expression(expr, &eval_ctx)?
         } else {
             (true, false, false)
@@ -351,6 +332,7 @@ impl Walker {
                     depth: ctx.depth,
                     output_manager: &self.output_manager,
                     batch_executor: &mut self.batch_executor,
+                    exit_code: &mut self.exit_code,
                 };
 
                 match action.execute(&mut action_ctx)? {
@@ -410,5 +392,20 @@ pub(crate) fn should_follow_metadata(mode: FollowSymlinks, is_commandline_arg: b
         FollowSymlinks::Always => true,
         FollowSymlinks::Commandline => is_commandline_arg,
         FollowSymlinks::Never => false,
+    }
+}
+
+/// -daystart 用の基準時刻「今日の終わり（明日 00:00 ローカル時刻）」を返す
+fn compute_day_end() -> Option<SystemTime> {
+    use chrono::{Duration, Local};
+
+    let tomorrow = Local::now().date_naive().checked_add_signed(Duration::days(1))?;
+    let midnight = tomorrow.and_hms_opt(0, 0, 0)?;
+    let local = midnight.and_local_timezone(Local).single()?;
+    let timestamp = local.timestamp();
+    if timestamp >= 0 {
+        Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(timestamp as u64))
+    } else {
+        None
     }
 }

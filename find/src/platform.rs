@@ -45,6 +45,17 @@ mod platform_impl {
         }
     }
 
+    /// パスから (デバイス番号, inode 番号, ハードリンク数) を取得する。
+    pub fn get_file_ids(path: &std::path::Path, follow: bool) -> Option<(u64, u64, u64)> {
+        let meta = if follow {
+            std::fs::metadata(path)
+        } else {
+            std::fs::symlink_metadata(path)
+        }
+        .ok()?;
+        Some((meta.dev(), meta.ino(), meta.nlink()))
+    }
+
     #[allow(dead_code)]
     pub fn get_blocks(meta: &Metadata) -> u64 {
         meta.blocks()
@@ -311,6 +322,46 @@ mod platform_impl {
         0
     }
 
+    /// パスから (デバイス番号, inode 番号, ハードリンク数) を取得する。
+    /// Windows では Metadata から取得できないため、ハンドルを開いて
+    /// GetFileInformationByHandle で問い合わせる
+    /// （ボリュームシリアル番号 + ファイルインデックス）。
+    pub fn get_file_ids(path: &std::path::Path, follow: bool) -> Option<(u64, u64, u64)> {
+        use std::fs::OpenOptions;
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+
+        // ディレクトリを開くには FILE_FLAG_BACKUP_SEMANTICS が必要。
+        // follow=false の場合はリパースポイント（シンボリックリンク）自体を開く。
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+        let mut flags = FILE_FLAG_BACKUP_SEMANTICS;
+        if !follow {
+            flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+        }
+
+        let file = OpenOptions::new()
+            .access_mode(0) // 属性の問い合わせのみ（読み取り権限不要）
+            .custom_flags(flags)
+            .open(path)
+            .ok()?;
+
+        unsafe {
+            let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+            if GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) == 0 {
+                return None;
+            }
+            let dev = info.dwVolumeSerialNumber as u64;
+            let ino = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
+            let nlink = info.nNumberOfLinks as u64;
+            Some((dev, ino, nlink))
+        }
+    }
+
     pub fn get_ctime(meta: &Metadata) -> SystemTime {
         meta.created().unwrap_or(UNIX_EPOCH)
     }
@@ -462,6 +513,152 @@ mod platform_impl {
 // 共通インターフェース
 // ============================================================================
 pub use platform_impl::*;
+
+/// ファイルの作成時刻（birth time）を返す。取得できないプラットフォーム／FS では None。
+pub fn get_btime(meta: &Metadata) -> Option<std::time::SystemTime> {
+    meta.created().ok()
+}
+
+/// ファイルが属するファイルシステムのタイプ名を返す（-fstype / %F 用）。
+///
+/// * Windows: ボリュームルートに対する `GetVolumeInformationW`（例: "NTFS", "FAT32"）
+/// * Linux: `/proc/mounts` の最長一致マウントポイントの fstype
+/// * その他: None
+///
+/// 結果はボリューム／マウントテーブル単位でキャッシュする。
+pub fn get_fstype(path: &std::path::Path) -> Option<String> {
+    fstype_impl::get_fstype(path)
+}
+
+#[cfg(windows)]
+mod fstype_impl {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<String>>>> = OnceLock::new();
+
+    pub fn get_fstype(path: &Path) -> Option<String> {
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().ok()?.join(path)
+        };
+        // ルート（"C:\" や "\\server\share\"）は ancestors の最後の要素
+        let root = abs.ancestors().last()?.to_path_buf();
+
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut cache = cache.lock().unwrap();
+        if let Some(cached) = cache.get(&root) {
+            return cached.clone();
+        }
+
+        let result = query_volume_fstype(&root);
+        cache.insert(root, result.clone());
+        result
+    }
+
+    fn query_volume_fstype(root: &Path) -> Option<String> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationW;
+
+        // GetVolumeInformationW はルートパスに末尾の '\' を要求する
+        let mut root_str = root.as_os_str().to_string_lossy().into_owned();
+        if !root_str.ends_with('\\') && !root_str.ends_with('/') {
+            root_str.push('\\');
+        }
+        let root_wide: Vec<u16> = std::ffi::OsString::from(&root_str)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let mut fs_name = [0u16; 64];
+        let ok = unsafe {
+            GetVolumeInformationW(
+                root_wide.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                fs_name.as_mut_ptr(),
+                fs_name.len() as u32,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        let len = fs_name.iter().position(|&c| c == 0).unwrap_or(0);
+        if len == 0 {
+            None
+        } else {
+            Some(String::from_utf16_lossy(&fs_name[..len]))
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod fstype_impl {
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+
+    /// (マウントポイント, fstype) のリスト。/proc/mounts が無い環境では空。
+    static MOUNTS: OnceLock<Vec<(PathBuf, String)>> = OnceLock::new();
+
+    pub fn get_fstype(path: &Path) -> Option<String> {
+        let mounts = MOUNTS.get_or_init(load_mounts);
+        if mounts.is_empty() {
+            return None;
+        }
+
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().ok()?.join(path)
+        };
+        let abs = abs.canonicalize().unwrap_or(abs);
+
+        // 最長一致するマウントポイントの fstype を返す
+        mounts
+            .iter()
+            .filter(|(mp, _)| abs.starts_with(mp))
+            .max_by_key(|(mp, _)| mp.as_os_str().len())
+            .map(|(_, t)| t.clone())
+    }
+
+    fn load_mounts() -> Vec<(PathBuf, String)> {
+        let Ok(content) = std::fs::read_to_string("/proc/mounts") else {
+            return Vec::new();
+        };
+        let mut mounts = Vec::new();
+        for line in content.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() >= 3 {
+                // /proc/mounts はスペース等を 8 進エスケープする（例: \040）
+                mounts.push((PathBuf::from(unescape_mount(fields[1])), fields[2].to_string()));
+            }
+        }
+        mounts
+    }
+
+    fn unescape_mount(s: &str) -> String {
+        let mut result = String::with_capacity(s.len());
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' && i + 3 < bytes.len() {
+                if let Ok(code) = u8::from_str_radix(&s[i + 1..i + 4], 8) {
+                    result.push(code as char);
+                    i += 4;
+                    continue;
+                }
+            }
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+        result
+    }
+}
 
 /// ファイルタイプを判定
 pub fn get_file_type_char(meta: &Metadata, is_symlink: bool) -> char {

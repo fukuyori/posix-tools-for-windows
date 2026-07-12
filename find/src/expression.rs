@@ -377,6 +377,7 @@ pub enum Action {
     FPrint(String),
     FPrint0(String),
     Printf(String),
+    FPrintf(String, String), // (ファイル, フォーマット)
     Ls,
     FLs(String),
     Exec {
@@ -399,6 +400,7 @@ pub enum TimeType {
     Access, // atime
     Change, // ctime (status change)
     Modify, // mtime
+    Birth,  // btime (creation time)
 }
 
 /// テスト式
@@ -418,6 +420,13 @@ pub enum Test {
         regex: Regex,
         case_insensitive: bool,
     },
+    /// -lname / -ilname: シンボリックリンクの内容がパターンにマッチ
+    Lname {
+        pattern: Pattern,
+        case_insensitive: bool,
+    },
+    /// -fstype: ファイルシステムのタイプ名
+    Fstype(String),
 
     // タイプ
     Type(FileType),
@@ -432,7 +441,11 @@ pub enum Test {
         time_type: TimeType,
         comparison: NumericComparison,
         minutes: bool,
+        /// -daystart が先行して指定されていた場合、今日の始まりを基準に測る
+        daystart: bool,
     },
+    /// -used n: 最終アクセスがステータス変更から n 日後
+    Used(NumericComparison),
     Newer {
         reference_time: SystemTime,
     },
@@ -491,6 +504,9 @@ pub struct EvalContext<'a> {
     pub start_path: &'a Path,
     pub depth: usize,
     pub now: SystemTime,
+    /// -daystart 用の基準時刻（今日の終わり = 明日 00:00）。
+    /// 未設定の場合は `now` と同じ。
+    pub day_end: SystemTime,
 
     /// `symlink_metadata` の結果。`None` はシンボリックリンクではないことを示す
     /// （リンクかどうかは `symlink_meta_result` で判定する）。
@@ -536,6 +552,7 @@ impl<'a> EvalContext<'a> {
             start_path,
             depth,
             now,
+            day_end: now,
             symlink_meta_result,
             lazy_meta,
             follow_symlinks,
@@ -566,6 +583,12 @@ impl<'a> EvalContext<'a> {
     #[inline]
     pub fn is_symlink(&self) -> bool {
         self.symlink_meta_result.is_some()
+    }
+
+    /// ウォーカーがシンボリックリンクを追跡するモードかどうか。
+    #[inline]
+    pub fn follows_symlinks(&self) -> bool {
+        self.follow_symlinks
     }
 }
 
@@ -628,12 +651,50 @@ impl Test {
             }
 
             Test::Xtype(ft) => {
-                // -xtype: symlink の場合はリンク先のタイプで判定
-                match ctx.metadata() {
-                    Some(m) => ft.matches(m, false),
-                    None => false,
+                // -xtype: -type の逆のリンク解決を行う（GNU 互換）。
+                // * 非シンボリックリンク: -type と同じ
+                // * シンボリックリンク（-P/-H で未追跡）: リンク先のタイプで判定。
+                //   リンク切れは 'l' として扱う
+                // * シンボリックリンク（-L で追跡済み）: 'l' のみ真
+                if !ctx.is_symlink() {
+                    return match ctx.metadata() {
+                        Some(m) => ft.matches(m, false),
+                        None => false,
+                    };
+                }
+                if ctx.follows_symlinks() {
+                    *ft == FileType::SymbolicLink
+                } else {
+                    match fs::metadata(ctx.path) {
+                        Ok(m) => ft.matches(&m, false),
+                        Err(_) => *ft == FileType::SymbolicLink,
+                    }
                 }
             }
+
+            Test::Lname {
+                pattern,
+                case_insensitive,
+            } => {
+                if !ctx.is_symlink() {
+                    return false;
+                }
+                match fs::read_link(ctx.path) {
+                    Ok(target) => {
+                        let target_str = target.to_string_lossy();
+                        if *case_insensitive {
+                            pattern.matches(&target_str.to_lowercase())
+                        } else {
+                            pattern.matches(&target_str)
+                        }
+                    }
+                    Err(_) => false,
+                }
+            }
+
+            Test::Fstype(name) => platform::get_fstype(ctx.path)
+                .map(|t| t.eq_ignore_ascii_case(name))
+                .unwrap_or(false),
 
             Test::Size(size_comp) => ctx
                 .metadata()
@@ -652,6 +713,7 @@ impl Test {
                 time_type,
                 comparison,
                 minutes,
+                daystart,
             } => {
                 let Some(m) = ctx.metadata() else {
                     return false;
@@ -660,9 +722,12 @@ impl Test {
                     TimeType::Access => m.accessed().ok(),
                     TimeType::Change => Some(platform::get_ctime(m)),
                     TimeType::Modify => m.modified().ok(),
+                    TimeType::Birth => platform::get_btime(m),
                 };
                 if let Some(ft) = file_time {
-                    let duration = ctx.now.duration_since(ft).unwrap_or(Duration::ZERO);
+                    // -daystart 指定時は「今日の終わり（明日 00:00）」を基準に測る
+                    let base = if *daystart { ctx.day_end } else { ctx.now };
+                    let duration = base.duration_since(ft).unwrap_or(Duration::ZERO);
                     let units = if *minutes {
                         (duration.as_secs() / 60) as i64
                     } else {
@@ -672,6 +737,21 @@ impl Test {
                 } else {
                     false
                 }
+            }
+
+            Test::Used(comparison) => {
+                let Some(m) = ctx.metadata() else {
+                    return false;
+                };
+                let Ok(atime) = m.accessed() else {
+                    return false;
+                };
+                let ctime = platform::get_ctime(m);
+                let days = atime
+                    .duration_since(ctime)
+                    .map(|d| (d.as_secs() / 86400) as i64)
+                    .unwrap_or(0);
+                comparison.matches(days)
             }
 
             Test::Newer { reference_time } => ctx
@@ -688,6 +768,7 @@ impl Test {
                     TimeType::Access => m.accessed().ok(),
                     TimeType::Change => Some(platform::get_ctime(m)),
                     TimeType::Modify => m.modified().ok(),
+                    TimeType::Birth => platform::get_btime(m),
                 };
                 file_time.map(|ft| ft > *reference).unwrap_or(false)
             }
@@ -736,23 +817,40 @@ impl Test {
                 .map(|m| platform::is_executable(m))
                 .unwrap_or(false),
 
-            Test::Links(comp) => ctx
-                .metadata()
-                .map(|m| comp.matches(platform::get_nlink(m) as i64))
+            Test::Links(comp) => file_ids(ctx)
+                .map(|(_, _, nlink)| comp.matches(nlink as i64))
                 .unwrap_or(false),
-            Test::Inum(comp) => ctx
-                .metadata()
-                .map(|m| comp.matches(platform::get_ino(m) as i64))
+            Test::Inum(comp) => file_ids(ctx)
+                .map(|(_, ino, _)| comp.matches(ino as i64))
                 .unwrap_or(false),
 
-            Test::Samefile { dev, ino } => ctx
-                .metadata()
-                .map(|m| platform::get_dev(m) == *dev && platform::get_ino(m) == *ino)
+            Test::Samefile { dev, ino } => file_ids(ctx)
+                .map(|(d, i, _)| d == *dev && i == *ino)
                 .unwrap_or(false),
 
             Test::True => true,
             Test::False => false,
         }
+    }
+}
+
+/// (デバイス番号, inode 番号, ハードリンク数) を返す。
+/// Unix は取得済みメタデータから、Windows はハンドル問い合わせで取得する。
+fn file_ids(ctx: &EvalContext) -> Option<(u64, u64, u64)> {
+    #[cfg(windows)]
+    {
+        platform::get_file_ids(ctx.path, ctx.follows_symlinks())
+    }
+
+    #[cfg(not(windows))]
+    {
+        ctx.metadata().map(|m| {
+            (
+                platform::get_dev(m),
+                platform::get_ino(m),
+                platform::get_nlink(m),
+            )
+        })
     }
 }
 

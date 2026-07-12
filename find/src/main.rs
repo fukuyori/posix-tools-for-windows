@@ -19,7 +19,7 @@ fn main() {
     }
 
     if args.iter().any(|a| a == "--version" || a == "-version") {
-        println!("find 1.0.0");
+        println!("find 1.1.0");
         return;
     }
 
@@ -212,6 +212,143 @@ mod tests {
         let result = parser.parse().unwrap();
         let walker = Walker::new(result.global_options, result.expression);
         assert!(!walker.use_default_print);
+    }
+
+    #[test]
+    fn test_parse_multi_type() {
+        let args = vec!["-type".to_string(), "f,d".to_string()];
+        let mut parser = Parser::new(args);
+        let result = parser.parse().unwrap();
+        match result.expression.unwrap() {
+            Expression::Or(a, b) => {
+                assert!(matches!(*a, Expression::Test(Test::Type(FileType::RegularFile))));
+                assert!(matches!(*b, Expression::Test(Test::Type(FileType::Directory))));
+            }
+            other => panic!("expected Or expression, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rejects_invalid_multi_type() {
+        let args = vec!["-type".to_string(), "f,".to_string()];
+        let mut parser = Parser::new(args);
+        assert!(parser.parse().is_err());
+    }
+
+    #[test]
+    fn test_parse_options_inside_expression() {
+        // GNU find と同様、-maxdepth などがテストの後に来ても受理する
+        let args = vec![
+            "-name".to_string(),
+            "*.txt".to_string(),
+            "-maxdepth".to_string(),
+            "2".to_string(),
+        ];
+        let mut parser = Parser::new(args);
+        let result = parser.parse().unwrap();
+        assert_eq!(result.global_options.max_depth, Some(2));
+        assert!(result.expression.is_some());
+    }
+
+    #[test]
+    fn test_parse_daystart_applies_to_following_time_tests() {
+        let args = vec![
+            "-mtime".to_string(),
+            "0".to_string(),
+            "-daystart".to_string(),
+            "-atime".to_string(),
+            "0".to_string(),
+        ];
+        let mut parser = Parser::new(args);
+        let result = parser.parse().unwrap();
+
+        fn collect_daystarts(expr: &Expression, out: &mut Vec<bool>) {
+            match expr {
+                Expression::Test(Test::Time { daystart, .. }) => out.push(*daystart),
+                Expression::Not(e) => collect_daystarts(e, out),
+                Expression::And(a, b) | Expression::Or(a, b) | Expression::List(a, b) => {
+                    collect_daystarts(a, out);
+                    collect_daystarts(b, out);
+                }
+                _ => {}
+            }
+        }
+
+        let mut daystarts = Vec::new();
+        collect_daystarts(result.expression.as_ref().unwrap(), &mut daystarts);
+        assert_eq!(daystarts, vec![false, true]);
+    }
+
+    #[test]
+    fn test_parse_used_and_lname() {
+        let args = vec![
+            "-used".to_string(),
+            "+2".to_string(),
+            "-lname".to_string(),
+            "*target*".to_string(),
+        ];
+        let mut parser = Parser::new(args);
+        let result = parser.parse().unwrap();
+        assert!(result.expression.is_some());
+    }
+
+    #[test]
+    fn test_parse_fprintf() {
+        let args = vec![
+            "-fprintf".to_string(),
+            "out.txt".to_string(),
+            "%p\\n".to_string(),
+        ];
+        let mut parser = Parser::new(args);
+        let result = parser.parse().unwrap();
+        assert!(result.expression.is_some());
+        // -fprintf はアクションなのでデフォルト print は無効
+        let walker = Walker::new(result.global_options, result.expression);
+        assert!(!walker.use_default_print);
+    }
+
+    #[test]
+    fn test_convert_regex_basic_syntax() {
+        use crate::parser::{convert_regex_syntax, RegexSyntax};
+
+        // BRE: \( \) がグループ、裸の ( ) + ? はリテラル
+        assert_eq!(
+            convert_regex_syntax(r"\(ab\)\+", RegexSyntax::Basic),
+            "(ab)+"
+        );
+        assert_eq!(convert_regex_syntax("a+b?", RegexSyntax::Basic), r"a\+b\?");
+        assert_eq!(convert_regex_syntax("(x)", RegexSyntax::Basic), r"\(x\)");
+        // Extended は無変換
+        assert_eq!(
+            convert_regex_syntax("(a|b)+", RegexSyntax::Extended),
+            "(a|b)+"
+        );
+        // Emacs: \| が選択、+ は特殊のまま
+        assert_eq!(
+            convert_regex_syntax(r"a\|b+", RegexSyntax::Emacs),
+            "a|b+"
+        );
+    }
+
+    #[test]
+    fn test_regex_matches_whole_path() {
+        // GNU find と同様、-regex はパス全体にマッチする
+        let args = vec!["-regex".to_string(), r".*\.txt".to_string()];
+        let mut parser = Parser::new(args);
+        let result = parser.parse().unwrap();
+        let Expression::Test(Test::Regex { regex, .. }) = result.expression.unwrap() else {
+            panic!("expected regex test");
+        };
+        assert!(regex.is_match("./foo/bar.txt"));
+        // 部分一致では真にならない（"txt" の後に続きがある場合は不一致）
+        assert!(!regex.is_match("./foo/bar.txt.bak"));
+    }
+
+    #[test]
+    fn test_parse_anewer_missing_file_errors() {
+        let args = vec!["-anewer".to_string(), "no_such_file_xyz".to_string()];
+        let mut parser = Parser::new(args);
+        assert!(parser.parse().is_err());
     }
 
     #[test]

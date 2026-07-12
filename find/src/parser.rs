@@ -47,15 +47,37 @@ pub struct ParseResult {
     pub global_options: GlobalOptions,
 }
 
+/// -regextype で選択される正規表現の方言
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RegexSyntax {
+    /// POSIX 拡張正規表現（デフォルト。GNU find の posix-extended 相当）
+    Extended,
+    /// POSIX 基本正規表現（\( \) \{ \} が特殊、( ) { } + ? | はリテラル）
+    Basic,
+    /// GNU Emacs 風（\( \) \| が特殊、( ) | { } はリテラル、+ ? は特殊）
+    Emacs,
+}
+
 /// パーサー
 pub struct Parser {
     args: Vec<String>,
     pos: usize,
+    options: GlobalOptions,
+    /// -daystart が出現したか（それ以降の時間テストに適用される）
+    daystart: bool,
+    /// -regextype で指定された方言（それ以降の -regex/-iregex に適用される）
+    regex_syntax: RegexSyntax,
 }
 
 impl Parser {
     pub fn new(args: Vec<String>) -> Self {
-        Parser { args, pos: 0 }
+        Parser {
+            args,
+            pos: 0,
+            options: GlobalOptions::default(),
+            daystart: false,
+            regex_syntax: RegexSyntax::Extended,
+        }
     }
 
     fn current(&self) -> Option<&str> {
@@ -84,34 +106,37 @@ impl Parser {
     }
 
     pub fn parse(&mut self) -> Result<ParseResult, String> {
-        let mut global_options = GlobalOptions::default();
         let mut paths = Vec::new();
 
         // Parse global options first
         while let Some(arg) = self.current() {
             match arg {
                 "-H" => {
-                    global_options.follow_symlinks = FollowSymlinks::Commandline;
+                    self.options.follow_symlinks = FollowSymlinks::Commandline;
                     self.advance();
                 }
                 "-L" => {
-                    global_options.follow_symlinks = FollowSymlinks::Always;
+                    self.options.follow_symlinks = FollowSymlinks::Always;
                     self.advance();
                 }
                 "-P" => {
-                    global_options.follow_symlinks = FollowSymlinks::Never;
+                    self.options.follow_symlinks = FollowSymlinks::Never;
                     self.advance();
                 }
                 "-D" => {
                     self.advance();
                     self.advance();
                 }
-                "-O" | "-Olevel" => {
+                // -O3 のような結合形式
+                s if s.starts_with("-O") && s[2..].chars().all(|c| c.is_ascii_digit()) => {
+                    let bare = s == "-O";
                     self.advance();
-                    if self
-                        .current()
-                        .map(|s| s.parse::<i32>().is_ok())
-                        .unwrap_or(false)
+                    // "-O" 単独の場合は次のトークンがレベル数値のことがある
+                    if bare
+                        && self
+                            .current()
+                            .map(|s| s.parse::<i32>().is_ok())
+                            .unwrap_or(false)
                     {
                         self.advance();
                     }
@@ -122,7 +147,7 @@ impl Parser {
 
         // Parse paths
         while let Some(arg) = self.current() {
-            if arg.starts_with('-')
+            if (arg.starts_with('-') && arg.len() > 1)
                 || is_open_paren(arg)
                 || is_not_operator(arg)
                 || is_list_separator(arg)
@@ -137,56 +162,8 @@ impl Parser {
             paths.push(PathBuf::from("."));
         }
 
-        // Parse positional options
-        while let Some(arg) = self.current() {
-            match arg {
-                "-maxdepth" => {
-                    let n_str = self.expect_arg("-maxdepth")?;
-                    let n: usize = n_str
-                        .parse()
-                        .map_err(|_| messages::err_invalid_argument("-maxdepth", &n_str))?;
-                    global_options.max_depth = Some(n);
-                    self.advance();
-                }
-                "-mindepth" => {
-                    let n_str = self.expect_arg("-mindepth")?;
-                    let n: usize = n_str
-                        .parse()
-                        .map_err(|_| messages::err_invalid_argument("-mindepth", &n_str))?;
-                    global_options.min_depth = Some(n);
-                    self.advance();
-                }
-                "-depth" | "-d" => {
-                    global_options.depth_first = true;
-                    self.advance();
-                }
-                "-xdev" | "-mount" => {
-                    global_options.xdev = true;
-                    self.advance();
-                }
-                "-noleaf"
-                | "-ignore_readdir_race"
-                | "-noignore_readdir_race"
-                | "-warn"
-                | "-nowarn" => {
-                    self.advance();
-                }
-                "-regextype" => {
-                    self.advance();
-                    self.advance();
-                }
-                "-help" | "--help" => {
-                    println!("{}", messages::HELP_MESSAGE);
-                    std::process::exit(0);
-                }
-                "-version" | "--version" => {
-                    println!("find 1.0.0");
-                    std::process::exit(0);
-                }
-                _ => break,
-            }
-        }
-
+        // 位置オプション（-maxdepth, -daystart, -regextype など）は
+        // parse_primary() 内で式の一部（常に真）として処理される。
         let expression = if self.current().is_some() {
             Some(self.parse_expression()?)
         } else {
@@ -203,15 +180,80 @@ impl Parser {
 
         if let Some(ref expr) = expression {
             if Self::contains_delete(expr) {
-                global_options.depth_first = true;
+                self.options.depth_first = true;
             }
         }
 
         Ok(ParseResult {
             paths,
             expression,
-            global_options,
+            global_options: self.options.clone(),
         })
+    }
+
+    /// 位置オプション／グローバルオプションを式の途中でも受け付ける（GNU 互換）。
+    /// オプションとして消費した場合は Some(Ok(()))、
+    /// オプションだが引数が不正な場合は Some(Err)、
+    /// オプションでない場合は None を返す。
+    fn try_parse_option(&mut self, arg: &str) -> Option<Result<(), String>> {
+        match arg {
+            "-maxdepth" => Some(self.parse_depth_option("-maxdepth", true)),
+            "-mindepth" => Some(self.parse_depth_option("-mindepth", false)),
+            "-depth" | "-d" => {
+                self.options.depth_first = true;
+                self.advance();
+                Some(Ok(()))
+            }
+            "-xdev" | "-mount" => {
+                self.options.xdev = true;
+                self.advance();
+                Some(Ok(()))
+            }
+            "-follow" => {
+                self.options.follow_symlinks = FollowSymlinks::Always;
+                self.advance();
+                Some(Ok(()))
+            }
+            "-daystart" => {
+                self.daystart = true;
+                self.advance();
+                Some(Ok(()))
+            }
+            "-noleaf" | "-ignore_readdir_race" | "-noignore_readdir_race" | "-warn"
+            | "-nowarn" => {
+                self.advance();
+                Some(Ok(()))
+            }
+            "-regextype" => {
+                let name = match self.expect_arg("-regextype") {
+                    Ok(n) => n,
+                    Err(e) => return Some(Err(e)),
+                };
+                match parse_regextype(&name) {
+                    Some(syntax) => {
+                        self.regex_syntax = syntax;
+                        self.advance();
+                        Some(Ok(()))
+                    }
+                    None => Some(Err(messages::err_invalid_regextype(&name))),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn parse_depth_option(&mut self, opt: &str, is_max: bool) -> Result<(), String> {
+        let n_str = self.expect_arg(opt)?;
+        let n: usize = n_str
+            .parse()
+            .map_err(|_| messages::err_invalid_argument(opt, &n_str))?;
+        if is_max {
+            self.options.max_depth = Some(n);
+        } else {
+            self.options.min_depth = Some(n);
+        }
+        self.advance();
+        Ok(())
     }
 
     fn contains_delete(expr: &Expression) -> bool {
@@ -302,6 +344,12 @@ impl Parser {
             .to_string();
         let arg_ref = arg.as_str();
 
+        // 位置オプション／グローバルオプションは常に真の式として扱う（GNU 互換）
+        if let Some(result) = self.try_parse_option(arg_ref) {
+            result?;
+            return Ok(Expression::Test(Test::True));
+        }
+
         match arg_ref {
             "-name" => {
                 let pattern_str = self.expect_arg("-name")?;
@@ -347,10 +395,31 @@ impl Parser {
                 }))
             }
 
+            "-lname" => {
+                let pattern_str = self.expect_arg("-lname")?;
+                let pattern = Pattern::new(&normalize_glob_pattern(&pattern_str))
+                    .map_err(|e| messages::err_invalid_argument("-lname", &e.to_string()))?;
+                self.advance();
+                Ok(Expression::Test(Test::Lname {
+                    pattern,
+                    case_insensitive: false,
+                }))
+            }
+
+            "-ilname" => {
+                let pattern_str = self.expect_arg("-ilname")?;
+                let pattern = Pattern::new(&normalize_glob_pattern(&pattern_str.to_lowercase()))
+                    .map_err(|e| messages::err_invalid_argument("-ilname", &e.to_string()))?;
+                self.advance();
+                Ok(Expression::Test(Test::Lname {
+                    pattern,
+                    case_insensitive: true,
+                }))
+            }
+
             "-regex" => {
                 let regex_str = self.expect_arg("-regex")?;
-                let regex = Regex::new(&regex_str)
-                    .map_err(|e| messages::err_invalid_regex(&regex_str, &e.to_string()))?;
+                let regex = self.build_path_regex(&regex_str, false)?;
                 self.advance();
                 Ok(Expression::Test(Test::Regex {
                     regex,
@@ -360,10 +429,7 @@ impl Parser {
 
             "-iregex" => {
                 let regex_str = self.expect_arg("-iregex")?;
-                let regex = RegexBuilder::new(&regex_str)
-                    .case_insensitive(true)
-                    .build()
-                    .map_err(|e| messages::err_invalid_regex(&regex_str, &e.to_string()))?;
+                let regex = self.build_path_regex(&regex_str, true)?;
                 self.advance();
                 Ok(Expression::Test(Test::Regex {
                     regex,
@@ -371,26 +437,14 @@ impl Parser {
                 }))
             }
 
-            "-type" => {
-                let type_str = self.expect_arg("-type")?;
-                if type_str.len() != 1 {
-                    return Err(messages::err_invalid_type(&type_str));
-                }
-                let ft = FileType::from_char(type_str.chars().next().unwrap())
-                    .ok_or_else(|| messages::err_invalid_type(&type_str))?;
-                self.advance();
-                Ok(Expression::Test(Test::Type(ft)))
-            }
+            "-type" => self.parse_type_test("-type", false),
 
-            "-xtype" => {
-                let type_str = self.expect_arg("-xtype")?;
-                if type_str.len() != 1 {
-                    return Err(messages::err_invalid_type(&type_str));
-                }
-                let ft = FileType::from_char(type_str.chars().next().unwrap())
-                    .ok_or_else(|| messages::err_invalid_type(&type_str))?;
+            "-xtype" => self.parse_type_test("-xtype", true),
+
+            "-fstype" => {
+                let fstype = self.expect_arg("-fstype")?;
                 self.advance();
-                Ok(Expression::Test(Test::Xtype(ft)))
+                Ok(Expression::Test(Test::Fstype(fstype)))
             }
 
             "-size" => {
@@ -406,76 +460,19 @@ impl Parser {
                 Ok(Expression::Test(Test::Empty))
             }
 
-            "-atime" => {
-                let n_str = self.expect_arg("-atime")?;
-                let comp = NumericComparison::parse(&n_str)
-                    .ok_or_else(|| messages::err_invalid_time(&n_str))?;
-                self.advance();
-                Ok(Expression::Test(Test::Time {
-                    time_type: TimeType::Access,
-                    comparison: comp,
-                    minutes: false,
-                }))
-            }
+            "-atime" => self.parse_time_test("-atime", TimeType::Access, false),
+            "-ctime" => self.parse_time_test("-ctime", TimeType::Change, false),
+            "-mtime" => self.parse_time_test("-mtime", TimeType::Modify, false),
+            "-amin" => self.parse_time_test("-amin", TimeType::Access, true),
+            "-cmin" => self.parse_time_test("-cmin", TimeType::Change, true),
+            "-mmin" => self.parse_time_test("-mmin", TimeType::Modify, true),
 
-            "-ctime" => {
-                let n_str = self.expect_arg("-ctime")?;
+            "-used" => {
+                let n_str = self.expect_arg("-used")?;
                 let comp = NumericComparison::parse(&n_str)
                     .ok_or_else(|| messages::err_invalid_time(&n_str))?;
                 self.advance();
-                Ok(Expression::Test(Test::Time {
-                    time_type: TimeType::Change,
-                    comparison: comp,
-                    minutes: false,
-                }))
-            }
-
-            "-mtime" => {
-                let n_str = self.expect_arg("-mtime")?;
-                let comp = NumericComparison::parse(&n_str)
-                    .ok_or_else(|| messages::err_invalid_time(&n_str))?;
-                self.advance();
-                Ok(Expression::Test(Test::Time {
-                    time_type: TimeType::Modify,
-                    comparison: comp,
-                    minutes: false,
-                }))
-            }
-
-            "-amin" => {
-                let n_str = self.expect_arg("-amin")?;
-                let comp = NumericComparison::parse(&n_str)
-                    .ok_or_else(|| messages::err_invalid_time(&n_str))?;
-                self.advance();
-                Ok(Expression::Test(Test::Time {
-                    time_type: TimeType::Access,
-                    comparison: comp,
-                    minutes: true,
-                }))
-            }
-
-            "-cmin" => {
-                let n_str = self.expect_arg("-cmin")?;
-                let comp = NumericComparison::parse(&n_str)
-                    .ok_or_else(|| messages::err_invalid_time(&n_str))?;
-                self.advance();
-                Ok(Expression::Test(Test::Time {
-                    time_type: TimeType::Change,
-                    comparison: comp,
-                    minutes: true,
-                }))
-            }
-
-            "-mmin" => {
-                let n_str = self.expect_arg("-mmin")?;
-                let comp = NumericComparison::parse(&n_str)
-                    .ok_or_else(|| messages::err_invalid_time(&n_str))?;
-                self.advance();
-                Ok(Expression::Test(Test::Time {
-                    time_type: TimeType::Modify,
-                    comparison: comp,
-                    minutes: true,
-                }))
+                Ok(Expression::Test(Test::Used(comp)))
             }
 
             "-newer" => {
@@ -490,17 +487,32 @@ impl Parser {
                 }))
             }
 
+            "-anewer" | "-cnewer" => {
+                let x = if arg_ref == "-anewer" {
+                    TimeType::Access
+                } else {
+                    TimeType::Change
+                };
+                let file = self.expect_arg(&arg)?;
+                let meta = fs::metadata(&file).map_err(|_| messages::err_file_not_found(&file))?;
+                let mtime = meta
+                    .modified()
+                    .map_err(|_| messages::err_file_not_found(&file))?;
+                self.advance();
+                Ok(Expression::Test(Test::NewerXY {
+                    x,
+                    y: TimeType::Modify,
+                    reference: mtime,
+                }))
+            }
+
             s if s.starts_with("-newer") && s.len() >= 8 => {
                 let arg_clone = arg.clone();
                 let suffix = &arg_clone[6..];
                 let chars: Vec<char> = suffix.chars().collect();
-                if chars.len() >= 2 {
-                    let x = match chars[0] {
-                        'a' => TimeType::Access,
-                        'c' => TimeType::Change,
-                        'm' => TimeType::Modify,
-                        _ => return Err(messages::err_unknown_option(&arg)),
-                    };
+                if chars.len() == 2 {
+                    let x = parse_time_type_char(chars[0])
+                        .ok_or_else(|| messages::err_unknown_option(&arg))?;
                     let (y, reference) = if chars[1] == 't' {
                         let time_str = self.expect_arg(&arg)?;
                         let time = parse_datetime(&time_str)
@@ -508,12 +520,8 @@ impl Parser {
                         self.advance();
                         (TimeType::Modify, time)
                     } else {
-                        let y = match chars[1] {
-                            'a' => TimeType::Access,
-                            'c' => TimeType::Change,
-                            'm' => TimeType::Modify,
-                            _ => return Err(messages::err_unknown_option(&arg)),
-                        };
+                        let y = parse_time_type_char(chars[1])
+                            .ok_or_else(|| messages::err_unknown_option(&arg))?;
                         let file = self.expect_arg(&arg)?;
                         let meta =
                             fs::metadata(&file).map_err(|_| messages::err_file_not_found(&file))?;
@@ -521,6 +529,8 @@ impl Parser {
                             TimeType::Access => meta.accessed().unwrap_or(UNIX_EPOCH),
                             TimeType::Change => platform::get_ctime(&meta),
                             TimeType::Modify => meta.modified().unwrap_or(UNIX_EPOCH),
+                            TimeType::Birth => platform::get_btime(&meta)
+                                .ok_or_else(|| messages::err_birth_time_unsupported(&file))?,
                         };
                         self.advance();
                         (y, reference)
@@ -622,12 +632,11 @@ impl Parser {
 
             "-samefile" => {
                 let file = self.expect_arg("-samefile")?;
-                let meta = fs::metadata(&file).map_err(|_| messages::err_file_not_found(&file))?;
+                fs::metadata(&file).map_err(|_| messages::err_file_not_found(&file))?;
+                let (dev, ino, _) = platform::get_file_ids(std::path::Path::new(&file), true)
+                    .ok_or_else(|| messages::err_file_not_found(&file))?;
                 self.advance();
-                Ok(Expression::Test(Test::Samefile {
-                    dev: platform::get_dev(&meta),
-                    ino: platform::get_ino(&meta),
-                }))
+                Ok(Expression::Test(Test::Samefile { dev, ino }))
             }
 
             "-true" => {
@@ -666,6 +675,18 @@ impl Parser {
                 let format = self.expect_arg("-printf")?;
                 self.advance();
                 Ok(Expression::Action(Action::Printf(format)))
+            }
+
+            "-fprintf" => {
+                let file = self.expect_arg("-fprintf")?;
+                self.advance();
+                let format = self
+                    .args
+                    .get(self.pos)
+                    .cloned()
+                    .ok_or_else(|| messages::err_missing_argument("-fprintf"))?;
+                self.advance();
+                Ok(Expression::Action(Action::FPrintf(file, format)))
             }
 
             "-ls" => {
@@ -715,6 +736,71 @@ impl Parser {
 
             _ => Err(messages::err_unknown_option(&arg)),
         }
+    }
+
+    /// -atime / -mmin などの時間テストを組み立てる。
+    /// それまでに -daystart が指定されていれば daystart フラグを立てる。
+    fn parse_time_test(
+        &mut self,
+        opt: &str,
+        time_type: TimeType,
+        minutes: bool,
+    ) -> Result<Expression, String> {
+        let n_str = self.expect_arg(opt)?;
+        let comp =
+            NumericComparison::parse(&n_str).ok_or_else(|| messages::err_invalid_time(&n_str))?;
+        self.advance();
+        Ok(Expression::Test(Test::Time {
+            time_type,
+            comparison: comp,
+            minutes,
+            daystart: self.daystart,
+        }))
+    }
+
+    /// -type / -xtype。GNU 4.10 互換で `f,d` のようなカンマ区切りを OR として展開する。
+    fn parse_type_test(&mut self, opt: &str, xtype: bool) -> Result<Expression, String> {
+        let type_str = self.expect_arg(opt)?;
+        self.advance();
+
+        let mut types = Vec::new();
+        for part in type_str.split(',') {
+            let mut chars = part.chars();
+            let (Some(c), None) = (chars.next(), chars.next()) else {
+                return Err(messages::err_invalid_type(&type_str));
+            };
+            let ft = FileType::from_char(c).ok_or_else(|| messages::err_invalid_type(&type_str))?;
+            types.push(ft);
+        }
+
+        let make_test = |ft| {
+            Expression::Test(if xtype {
+                Test::Xtype(ft)
+            } else {
+                Test::Type(ft)
+            })
+        };
+
+        let mut iter = types.into_iter();
+        let first = iter
+            .next()
+            .ok_or_else(|| messages::err_invalid_type(&type_str))?;
+        let mut expr = make_test(first);
+        for ft in iter {
+            expr = Expression::Or(Box::new(expr), Box::new(make_test(ft)));
+        }
+        Ok(expr)
+    }
+
+    /// -regex / -iregex 用の正規表現を組み立てる。
+    /// GNU find と同様、パス全体にマッチするよう暗黙にアンカーする。
+    fn build_path_regex(&self, pattern: &str, case_insensitive: bool) -> Result<Regex, String> {
+        let converted = convert_regex_syntax(pattern, self.regex_syntax);
+        let anchored = format!("^(?:{})$", converted);
+        RegexBuilder::new(&anchored)
+            .case_insensitive(case_insensitive)
+            .build()
+            .map_err(|e| messages::err_invalid_regex(pattern, &e.to_string()))
     }
 
     fn parse_exec_command(&mut self, opt: &str) -> Result<(Vec<String>, ExecType), String> {
@@ -825,12 +911,102 @@ fn is_exec_terminator(arg: &str) -> bool {
     arg == ";" || arg == "\\;"
 }
 
+fn parse_time_type_char(c: char) -> Option<TimeType> {
+    match c {
+        'a' => Some(TimeType::Access),
+        'c' => Some(TimeType::Change),
+        'm' => Some(TimeType::Modify),
+        'B' => Some(TimeType::Birth),
+        _ => None,
+    }
+}
+
+/// -regextype の名前を方言に対応付ける
+fn parse_regextype(name: &str) -> Option<RegexSyntax> {
+    match name {
+        "emacs" | "findutils-default" => Some(RegexSyntax::Emacs),
+        "posix-basic" | "posix-minimal-basic" | "ed" | "sed" | "grep" => Some(RegexSyntax::Basic),
+        "posix-extended" | "posix-egrep" | "egrep" | "posix-awk" | "awk" | "gnu-awk" => {
+            Some(RegexSyntax::Extended)
+        }
+        _ => None,
+    }
+}
+
+/// BRE / Emacs 方言を rust の regex クレート（ERE 相当）の構文へ変換する。
+///
+/// * Basic: `\( \) \{ \} \| \+ \?` が特殊 → `( ) { } | + ?` へ昇格。
+///          裸の `( ) { } | + ?` はリテラル → エスケープする。
+/// * Emacs: `\( \) \|` が特殊 → 昇格。裸の `( ) |` と `{ }` はリテラル。
+///          `+ ?` は Emacs でも特殊なのでそのまま。
+/// * Extended: 無変換。
+pub(crate) fn convert_regex_syntax(pattern: &str, syntax: RegexSyntax) -> String {
+    if syntax == RegexSyntax::Extended {
+        return pattern.to_string();
+    }
+    let basic = syntax == RegexSyntax::Basic;
+
+    let mut out = String::with_capacity(pattern.len() + 8);
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some(n) => {
+                    let promote = match n {
+                        '(' | ')' | '|' => true,
+                        '{' | '}' | '+' | '?' => basic,
+                        _ => false,
+                    };
+                    if promote {
+                        out.push(n);
+                    } else {
+                        out.push('\\');
+                        out.push(n);
+                    }
+                }
+                None => out.push('\\'),
+            },
+            '(' | ')' | '|' | '{' | '}' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '+' | '?' if basic => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn parse_datetime(s: &str) -> Option<SystemTime> {
     use chrono::{Local, NaiveDateTime, TimeZone};
+
+    // "@エポック秒" 形式（GNU 互換）
+    if let Some(epoch_str) = s.strip_prefix('@') {
+        if let Ok(secs) = epoch_str.parse::<i64>() {
+            return if secs >= 0 {
+                Some(UNIX_EPOCH + Duration::from_secs(secs as u64))
+            } else {
+                UNIX_EPOCH.checked_sub(Duration::from_secs(secs.unsigned_abs()))
+            };
+        }
+    }
+
+    // RFC 3339 / ISO 8601（タイムゾーン付き）
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        let ts = dt.timestamp();
+        if ts >= 0 {
+            return Some(UNIX_EPOCH + Duration::from_secs(ts as u64));
+        }
+    }
 
     let formats = [
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
         "%Y-%m-%d",
         "%Y/%m/%d %H:%M:%S",
         "%Y/%m/%d %H:%M",

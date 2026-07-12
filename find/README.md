@@ -120,18 +120,35 @@ Unix 系シェルでは通常の `find` と同じ感覚で使えます。
 
 ## 対応している主な述語・アクション
 
-- 名前系: `-name`, `-iname`, `-path`, `-ipath`, `-regex`, `-iregex`
-- 種別系: `-type`, `-xtype`
-- サイズ・時刻系: `-size`, `-atime`, `-ctime`, `-mtime`, `-amin`, `-cmin`, `-mmin`, `-newer`, `-newerXY`
+- 名前系: `-name`, `-iname`, `-path`, `-ipath`, `-lname`, `-ilname`, `-regex`, `-iregex`, `-regextype`
+- 種別系: `-type`, `-xtype`（`f,d` のようなカンマ区切り OR にも対応）, `-fstype`
+- サイズ・時刻系: `-size`, `-atime`, `-ctime`, `-mtime`, `-amin`, `-cmin`, `-mmin`, `-used`,
+  `-newer`, `-anewer`, `-cnewer`, `-newerXY`（`B`=作成時刻, `t`=絶対時刻・`@epoch` も可）, `-daystart`
 - 所有者・権限系: `-user`, `-group`, `-uid`, `-gid`, `-nouser`, `-nogroup`, `-perm`, `-readable`, `-writable`, `-executable`
 - その他: `-empty`, `-links`, `-inum`, `-samefile`, `-true`, `-false`
-- アクション: `-print`, `-printf`, `-ls`, `-exec`, `-execdir`, `-delete`, `-prune`, `-quit`
+- アクション: `-print`, `-print0`, `-fprint`, `-fprint0`, `-printf`, `-fprintf`, `-ls`, `-fls`,
+  `-exec`, `-execdir`, `-ok`, `-okdir`, `-delete`, `-prune`, `-quit`
+- グローバル: `-H`, `-L`, `-P`, `-follow`, `-maxdepth`, `-mindepth`, `-depth`, `-xdev`/`-mount`
+
+## GNU find 互換の挙動
+
+- 走査はプレオーダー深さ優先（`-depth` でポストオーダー）で、GNU `find` と同じ出力順
+- `-regex` / `-iregex` はパス全体にマッチ（暗黙アンカー）
+- `-regextype` で `emacs` / `posix-basic`（`ed`/`sed`/`grep`）/ `posix-extended`（デフォルト）等を選択可能
+- `-maxdepth` などの位置オプションはテストの後に書いても受理
+- `-exec {} +` のコマンドが失敗すると終了コードに反映（`{} \;` は述語の真偽としてのみ機能）
+- `-execdir` はファイル名に `./` を前置してコマンドに渡す
+- `-printf` は `%-8s` のようなフラグ・フィールド幅、`%D` `%F` `%S` `%B<fmt>`、
+  `\a \b \f \v \NNN \c` エスケープに対応
+- `-L` でのシンボリックリンク循環を検出して警告
+- `-delete` は `.` の削除を拒否し、失敗しても走査を継続（終了コードに反映）
 
 ## 注意点
 
 - これは Windows 標準の `find.exe` ではなく、POSIX 風の別実装です
 - Windows のパスを比較する内部処理では `/` 区切りに正規化しています
-- すべての GNU `find` 拡張を完全再現することは目的にしていません
+- `-regextype` のデフォルトは GNU（emacs）と異なり `posix-extended` 相当です
+- Windows では `-user`/`-perm` などの所有者・パーミッション情報は簡易的なエミュレーションです
 
 ## テスト
 

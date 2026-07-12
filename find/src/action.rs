@@ -110,6 +110,9 @@ pub struct BatchExecutor {
     commands: HashMap<String, BatchEntry>,
     /// コマンドライン長の上限（UTF-16 コード単位数）
     cmdline_limit: usize,
+    /// いずれかのバッチ実行が失敗（起動失敗 or 非ゼロ終了）したか。
+    /// GNU find と同様、`-exec {} +` の失敗は find の終了コードに反映する。
+    failed: bool,
 }
 
 impl BatchExecutor {
@@ -117,7 +120,13 @@ impl BatchExecutor {
         BatchExecutor {
             commands: HashMap::new(),
             cmdline_limit: get_cmdline_limit(),
+            failed: false,
         }
+    }
+
+    /// これまでのバッチ実行で失敗があったか
+    pub fn had_failure(&self) -> bool {
+        self.failed
     }
 
     /// `dir` は -execdir 時のみ Some を渡す。
@@ -155,7 +164,9 @@ impl BatchExecutor {
             if !entry.files.is_empty() && projected >= self.cmdline_limit {
                 // 現在の entry をフラッシュし、キーを削除
                 if let Some(mut e) = self.commands.remove(&key) {
-                    Self::run_batch(&mut e);
+                    if !Self::run_batch(&mut e) {
+                        self.failed = true;
+                    }
                 }
                 // 削除後に新エントリを挿入
                 self.commands.insert(
@@ -177,9 +188,10 @@ impl BatchExecutor {
         entry.files_cmdline_len += file_cl;
     }
 
-    fn run_batch(entry: &mut BatchEntry) {
+    /// バッチを実行し、成功したかどうかを返す。
+    fn run_batch(entry: &mut BatchEntry) -> bool {
         if entry.files.is_empty() {
-            return;
+            return true;
         }
 
         let mut cmd_parts: Vec<String> = Vec::new();
@@ -199,19 +211,28 @@ impl BatchExecutor {
             cmd_parts.extend(entry.files.iter().cloned());
         }
 
-        if !cmd_parts.is_empty() {
-            let mut cmd = Command::new(&cmd_parts[0]);
-            cmd.args(&cmd_parts[1..]);
-            if let Some(ref d) = entry.dir {
-                cmd.current_dir(d);
+        if cmd_parts.is_empty() {
+            return true;
+        }
+        let mut cmd = Command::new(&cmd_parts[0]);
+        cmd.args(&cmd_parts[1..]);
+        if let Some(ref d) = entry.dir {
+            cmd.current_dir(d);
+        }
+        match cmd.status() {
+            Ok(status) => status.success(),
+            Err(e) => {
+                eprintln!("{}", messages::err_exec_failed(&cmd_parts[0], &e.to_string()));
+                false
             }
-            let _ = cmd.status();
         }
     }
 
     pub fn flush(&mut self) {
         for entry in self.commands.values_mut() {
-            Self::run_batch(entry);
+            if !Self::run_batch(entry) {
+                self.failed = true;
+            }
         }
         self.commands.clear();
     }
@@ -228,6 +249,9 @@ pub struct ActionContext<'a> {
     pub depth: usize,
     pub output_manager: &'a OutputManager,
     pub batch_executor: &'a mut BatchExecutor,
+    /// find 全体の終了コード。アクションの失敗（-exec 起動失敗、-delete 失敗など）を
+    /// 致命的エラーにせず記録するために使う。
+    pub exit_code: &'a mut i32,
 }
 
 impl<'a> ActionContext<'a> {
@@ -281,9 +305,17 @@ impl Action {
             }
 
             Action::Printf(format) => {
-                let output = format_printf(format, ctx)?;
+                let output = format_printf(format, ctx);
                 print!("{}", output);
                 let _ = io::stdout().flush();
+                Ok(ActionResult::Continue)
+            }
+
+            Action::FPrintf(file, format) => {
+                let output = format_printf(format, ctx);
+                ctx.output_manager
+                    .write(file, &output)
+                    .map_err(|e| messages::err_cannot_open_file(file, &e.to_string()))?;
                 Ok(ActionResult::Continue)
             }
 
@@ -306,28 +338,20 @@ impl Action {
                 exec_type,
                 in_dir,
             } => {
-                let path_str = ctx.path.to_string_lossy().to_string();
-                let dir = if *in_dir {
-                    ctx.path.parent().map(|p| p.to_path_buf())
-                } else {
-                    None
-                };
-
-                let file_arg = if *in_dir {
-                    ctx.path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or(path_str.clone())
-                } else {
-                    path_str.clone()
-                };
+                let (file_arg, dir) = exec_target(ctx, *in_dir);
 
                 match exec_type {
                     ExecType::Each => {
-                        // -exec の終了コードは述語の真偽値として機能する
-                        let success = execute_command(command, &file_arg, dir.as_deref())?;
-                        if !success {
-                            return Ok(ActionResult::False);
+                        // -exec の終了コードは述語の真偽値として機能する。
+                        // コマンドの起動失敗は致命的エラーにせず、終了コードに記録して続行する。
+                        match execute_command(command, &file_arg, dir.as_deref()) {
+                            Ok(true) => {}
+                            Ok(false) => return Ok(ActionResult::False),
+                            Err(e) => {
+                                eprintln!("{}", e);
+                                *ctx.exit_code = 1;
+                                return Ok(ActionResult::False);
+                            }
                         }
                     }
                     ExecType::Batch => {
@@ -339,21 +363,7 @@ impl Action {
             }
 
             Action::Ok { command, in_dir } => {
-                let path_str = ctx.path.to_string_lossy().to_string();
-                let dir = if *in_dir {
-                    ctx.path.parent().map(|p| p.to_path_buf())
-                } else {
-                    None
-                };
-
-                let file_arg = if *in_dir {
-                    ctx.path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or(path_str.clone())
-                } else {
-                    path_str.clone()
-                };
+                let (file_arg, dir) = exec_target(ctx, *in_dir);
 
                 let cmd_str = command.join(" ");
                 eprint!("{}", messages::prompt_exec(&cmd_str, &file_arg));
@@ -363,9 +373,14 @@ impl Action {
                 if io::stdin().read_line(&mut response).is_ok() {
                     let response = response.trim().to_lowercase();
                     if response == "y" || response == "yes" {
-                        let success = execute_command(command, &file_arg, dir.as_deref())?;
-                        if !success {
-                            return Ok(ActionResult::False);
+                        match execute_command(command, &file_arg, dir.as_deref()) {
+                            Ok(true) => {}
+                            Ok(false) => return Ok(ActionResult::False),
+                            Err(e) => {
+                                eprintln!("{}", e);
+                                *ctx.exit_code = 1;
+                                return Ok(ActionResult::False);
+                            }
                         }
                     } else {
                         // ユーザーが拒否した場合も false
@@ -377,15 +392,29 @@ impl Action {
 
             Action::Delete => {
                 let path = ctx.path;
+
+                // GNU find と同様、"." の削除は拒否する
+                if path == Path::new(".") {
+                    eprintln!("{}", messages::err_delete_current_dir());
+                    *ctx.exit_code = 1;
+                    return Ok(ActionResult::False);
+                }
+
                 let result = if ctx.metadata().map(|m| m.is_dir()).unwrap_or(false) {
                     fs::remove_dir(path)
                 } else {
                     fs::remove_file(path)
                 };
 
-                result.map_err(|e| {
-                    messages::err_delete_failed(&path.display().to_string(), &e.to_string())
-                })?;
+                // 削除失敗は警告して続行（GNU 互換）
+                if let Err(e) = result {
+                    eprintln!(
+                        "{}",
+                        messages::err_delete_failed(&path.display().to_string(), &e.to_string())
+                    );
+                    *ctx.exit_code = 1;
+                    return Ok(ActionResult::False);
+                }
 
                 Ok(ActionResult::Continue)
             }
@@ -395,6 +424,28 @@ impl Action {
             Action::Quit => Ok(ActionResult::Quit),
         }
     }
+}
+
+/// -exec / -ok 系のコマンドに渡すファイル引数と実行ディレクトリを決める。
+/// -execdir / -okdir では GNU find と同様、ファイル名に `./` を前置して
+/// `-` で始まるファイル名がオプションと誤解釈されるのを防ぐ。
+fn exec_target(ctx: &ActionContext, in_dir: bool) -> (String, Option<PathBuf>) {
+    if !in_dir {
+        return (ctx.path.to_string_lossy().into_owned(), None);
+    }
+
+    let dir = ctx.path.parent().and_then(|p| {
+        if p.as_os_str().is_empty() {
+            None
+        } else {
+            Some(p.to_path_buf())
+        }
+    });
+    let file_arg = match ctx.path.file_name() {
+        Some(name) => format!("./{}", name.to_string_lossy()),
+        None => ctx.path.to_string_lossy().into_owned(),
+    };
+    (file_arg, dir)
 }
 
 fn execute_command(command: &[String], file: &str, dir: Option<&Path>) -> Result<bool, String> {
@@ -429,21 +480,39 @@ fn execute_command(command: &[String], file: &str, dir: Option<&Path>) -> Result
     Ok(status.success())
 }
 
-fn format_printf(format: &str, ctx: &ActionContext) -> Result<String, String> {
+fn format_printf(format: &str, ctx: &ActionContext) -> String {
     // -printf はメタデータを参照するフォーマット指定子を含む可能性がある。
     // 取得できない場合でも可能な限り出力する（メタデータが必要な項目は "?" で代替）。
-    let meta_opt = ctx.metadata();
     let mut result = String::new();
     let mut chars = format.chars().peekable();
 
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.next() {
+                Some('a') => result.push('\x07'),
+                Some('b') => result.push('\x08'),
+                Some('f') => result.push('\x0C'),
                 Some('n') => result.push('\n'),
-                Some('t') => result.push('\t'),
                 Some('r') => result.push('\r'),
-                Some('0') => result.push('\0'),
+                Some('t') => result.push('\t'),
+                Some('v') => result.push('\x0B'),
                 Some('\\') => result.push('\\'),
+                // \c: この時点で出力を打ち切る（GNU 互換）
+                Some('c') => return result,
+                // \NNN: 8進数エスケープ（1〜3桁）
+                Some(d) if d.is_digit(8) => {
+                    let mut val = d.to_digit(8).unwrap();
+                    for _ in 0..2 {
+                        match chars.peek() {
+                            Some(&n) if n.is_digit(8) => {
+                                val = val * 8 + n.to_digit(8).unwrap();
+                                chars.next();
+                            }
+                            _ => break,
+                        }
+                    }
+                    result.push(char::from_u32(val).unwrap_or('\0'));
+                }
                 Some(c) => {
                     result.push('\\');
                     result.push(c);
@@ -451,134 +520,216 @@ fn format_printf(format: &str, ctx: &ActionContext) -> Result<String, String> {
                 None => result.push('\\'),
             }
         } else if c == '%' {
-            match chars.next() {
-                Some('%') => result.push('%'),
-                Some('p') => result.push_str(&ctx.path.display().to_string()),
-                Some('f') => {
-                    if let Some(name) = ctx.path.file_name() {
-                        result.push_str(&name.to_string_lossy());
-                    }
+            // printf 風のフラグ・フィールド幅（例: %-8s, %5d）
+            let mut left_align = false;
+            let mut zero_pad = false;
+            while let Some(&f) = chars.peek() {
+                match f {
+                    '-' => left_align = true,
+                    '0' => zero_pad = true,
+                    '+' | ' ' | '#' => {}
+                    _ => break,
                 }
-                Some('h') => {
-                    if let Some(parent) = ctx.path.parent() {
-                        result.push_str(&parent.display().to_string());
-                    } else {
-                        result.push('.');
-                    }
+                chars.next();
+            }
+            let mut width: usize = 0;
+            while let Some(&d) = chars.peek() {
+                if let Some(v) = d.to_digit(10) {
+                    width = width * 10 + v as usize;
+                    chars.next();
+                } else {
+                    break;
                 }
-                Some('P') => {
-                    if let Ok(rel) = ctx.path.strip_prefix(ctx.start_path) {
-                        result.push_str(&rel.display().to_string());
-                    } else {
-                        result.push_str(&ctx.path.display().to_string());
-                    }
+            }
+            // 精度指定は受理して無視する
+            if chars.peek() == Some(&'.') {
+                chars.next();
+                while chars.peek().map_or(false, |d| d.is_ascii_digit()) {
+                    chars.next();
                 }
-                Some('H') => result.push_str(&ctx.start_path.display().to_string()),
-                Some('d') => result.push_str(&ctx.depth.to_string()),
-                Some('s') => {
-                    result.push_str(&ctx.metadata().map(|m| m.len()).unwrap_or(0).to_string())
-                }
-                Some('k') => result.push_str(
-                    &((ctx.metadata().map(|m| m.len()).unwrap_or(0) + 1023) / 1024).to_string(),
-                ),
-                Some('b') => result.push_str(
-                    &((ctx.metadata().map(|m| m.len()).unwrap_or(0) + 511) / 512).to_string(),
-                ),
-                Some('m') => result.push_str(&format!(
-                    "{:o}",
-                    platform::get_mode(meta_opt.unwrap()) & 0o7777
-                )),
-                Some('M') => result.push_str(&platform::format_mode_symbolic(
-                    platform::get_mode(meta_opt.unwrap()),
-                    meta_opt.unwrap(),
-                )),
-                Some('u') => {
-                    let uid = platform::get_uid(meta_opt.unwrap());
-                    if let Some(name) = platform::get_user_name(uid) {
-                        result.push_str(&name);
-                    } else {
-                        result.push_str(&uid.to_string());
-                    }
-                }
-                Some('U') => result.push_str(&platform::get_uid(meta_opt.unwrap()).to_string()),
-                Some('g') => {
-                    let gid = platform::get_gid(meta_opt.unwrap());
-                    if let Some(name) = platform::get_group_name(gid) {
-                        result.push_str(&name);
-                    } else {
-                        result.push_str(&gid.to_string());
-                    }
-                }
-                Some('G') => result.push_str(&platform::get_gid(meta_opt.unwrap()).to_string()),
-                Some('l') => {
-                    if let Ok(target) = fs::read_link(ctx.path) {
-                        result.push_str(&target.display().to_string());
-                    }
-                }
-                Some('i') => result.push_str(&platform::get_ino(meta_opt.unwrap()).to_string()),
-                Some('n') => result.push_str(&platform::get_nlink(meta_opt.unwrap()).to_string()),
-                Some('y') => {
-                    let is_symlink = ctx
-                        .symlink_metadata()
-                        .map(|m| m.file_type().is_symlink())
-                        .unwrap_or(false);
-                    result.push(platform::get_file_type_char(
-                        ctx.symlink_metadata()
-                            .unwrap_or_else(|| ctx.metadata().unwrap()),
-                        is_symlink,
-                    ));
-                }
-                Some('Y') => {
-                    result.push(platform::get_file_type_char(meta_opt.unwrap(), false));
-                }
-                Some('a') => {
-                    if let Ok(atime) = ctx.metadata().and_then(|m| m.accessed().ok()).ok_or(()) {
-                        result.push_str(&format_time_default(atime));
-                    }
-                }
-                Some('A') => {
-                    if let Some(fmt_char) = chars.next() {
-                        if let Ok(atime) = ctx.metadata().and_then(|m| m.accessed().ok()).ok_or(())
-                        {
-                            result.push_str(&format_time_strftime(atime, fmt_char));
+            }
+
+            let Some(dir) = chars.next() else {
+                result.push('%');
+                break;
+            };
+
+            match printf_directive_value(dir, &mut chars, ctx) {
+                Some(value) => {
+                    let len = value.chars().count();
+                    if width > len {
+                        let pad = width - len;
+                        if left_align {
+                            result.push_str(&value);
+                            result.extend(std::iter::repeat(' ').take(pad));
+                        } else {
+                            let pad_char = if zero_pad { '0' } else { ' ' };
+                            result.extend(std::iter::repeat(pad_char).take(pad));
+                            result.push_str(&value);
                         }
+                    } else {
+                        result.push_str(&value);
                     }
                 }
-                Some('c') => {
-                    let ctime = platform::get_ctime(meta_opt.unwrap());
-                    result.push_str(&format_time_default(ctime));
-                }
-                Some('C') => {
-                    if let Some(fmt_char) = chars.next() {
-                        let ctime = platform::get_ctime(meta_opt.unwrap());
-                        result.push_str(&format_time_strftime(ctime, fmt_char));
-                    }
-                }
-                Some('t') => {
-                    if let Ok(mtime) = ctx.metadata().and_then(|m| m.modified().ok()).ok_or(()) {
-                        result.push_str(&format_time_default(mtime));
-                    }
-                }
-                Some('T') => {
-                    if let Some(fmt_char) = chars.next() {
-                        if let Ok(mtime) = ctx.metadata().and_then(|m| m.modified().ok()).ok_or(())
-                        {
-                            result.push_str(&format_time_strftime(mtime, fmt_char));
-                        }
-                    }
-                }
-                Some(c) => {
+                None => {
+                    // 未知の指定子はリテラルとして出力
                     result.push('%');
-                    result.push(c);
+                    result.push(dir);
                 }
-                None => result.push('%'),
             }
         } else {
             result.push(c);
         }
     }
 
-    Ok(result)
+    result
+}
+
+/// %ディレクティブ1個分の値を返す。未知の指定子は None。
+/// %A/%B/%C/%T はフォーマット文字を追加で消費する。
+fn printf_directive_value(
+    dir: char,
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+    ctx: &ActionContext,
+) -> Option<String> {
+    let meta = ctx.metadata();
+
+    let value = match dir {
+        '%' => "%".to_string(),
+        'p' => ctx.path.display().to_string(),
+        'f' => ctx
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        'h' => ctx
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| ".".to_string()),
+        'P' => match ctx.path.strip_prefix(ctx.start_path) {
+            Ok(rel) => rel.display().to_string(),
+            Err(_) => ctx.path.display().to_string(),
+        },
+        'H' => ctx.start_path.display().to_string(),
+        'd' => ctx.depth.to_string(),
+        's' => meta.map(|m| m.len()).unwrap_or(0).to_string(),
+        'k' => {
+            // 1KiB ブロック数（512B ブロック数から換算、切り上げ）
+            let blocks = meta.map(platform::get_blocks).unwrap_or(0);
+            ((blocks + 1) / 2).to_string()
+        }
+        'b' => meta.map(platform::get_blocks).unwrap_or(0).to_string(),
+        'S' => {
+            // スパース度: blocks*512 / size
+            match meta {
+                Some(m) => {
+                    let size = m.len();
+                    if size == 0 {
+                        "1.0".to_string()
+                    } else {
+                        let sparseness = (platform::get_blocks(m) * 512) as f64 / size as f64;
+                        format!("{:.1}", sparseness)
+                    }
+                }
+                None => "?".to_string(),
+            }
+        }
+        'm' => meta
+            .map(|m| format!("{:o}", platform::get_mode(m) & 0o7777))
+            .unwrap_or_else(|| "?".to_string()),
+        'M' => meta
+            .map(|m| platform::format_mode_symbolic(platform::get_mode(m), m))
+            .unwrap_or_else(|| "??????????".to_string()),
+        'u' => meta
+            .map(|m| {
+                let uid = platform::get_uid(m);
+                platform::get_user_name(uid).unwrap_or_else(|| uid.to_string())
+            })
+            .unwrap_or_else(|| "?".to_string()),
+        'U' => meta
+            .map(|m| platform::get_uid(m).to_string())
+            .unwrap_or_else(|| "?".to_string()),
+        'g' => meta
+            .map(|m| {
+                let gid = platform::get_gid(m);
+                platform::get_group_name(gid).unwrap_or_else(|| gid.to_string())
+            })
+            .unwrap_or_else(|| "?".to_string()),
+        'G' => meta
+            .map(|m| platform::get_gid(m).to_string())
+            .unwrap_or_else(|| "?".to_string()),
+        'l' => fs::read_link(ctx.path)
+            .map(|t| t.display().to_string())
+            .unwrap_or_default(),
+        'i' => action_file_ids(ctx)
+            .map(|(_, ino, _)| ino.to_string())
+            .unwrap_or_else(|| "?".to_string()),
+        'n' => action_file_ids(ctx)
+            .map(|(_, _, nlink)| nlink.to_string())
+            .unwrap_or_else(|| "?".to_string()),
+        'D' => action_file_ids(ctx)
+            .map(|(dev, _, _)| dev.to_string())
+            .unwrap_or_else(|| "?".to_string()),
+        'F' => platform::get_fstype(ctx.path).unwrap_or_default(),
+        'y' => {
+            let is_symlink = ctx
+                .symlink_metadata()
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            match ctx.symlink_metadata().or(meta) {
+                Some(m) => platform::get_file_type_char(m, is_symlink).to_string(),
+                None => "?".to_string(),
+            }
+        }
+        'Y' => {
+            // リンク先を辿ったタイプ。リンク切れは 'N'（GNU 互換）
+            let is_symlink = ctx
+                .symlink_metadata()
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            if is_symlink {
+                match fs::metadata(ctx.path) {
+                    Ok(m) => platform::get_file_type_char(&m, false).to_string(),
+                    Err(_) => "N".to_string(),
+                }
+            } else {
+                match meta {
+                    Some(m) => platform::get_file_type_char(m, false).to_string(),
+                    None => "?".to_string(),
+                }
+            }
+        }
+        'a' => match meta.and_then(|m| m.accessed().ok()) {
+            Some(t) => format_time_default(t),
+            None => "?".to_string(),
+        },
+        'c' => match meta {
+            Some(m) => format_time_default(platform::get_ctime(m)),
+            None => "?".to_string(),
+        },
+        't' => match meta.and_then(|m| m.modified().ok()) {
+            Some(t) => format_time_default(t),
+            None => "?".to_string(),
+        },
+        'A' | 'B' | 'C' | 'T' => {
+            let fmt_char = chars.next()?;
+            let time = match dir {
+                'A' => meta.and_then(|m| m.accessed().ok()),
+                'B' => meta.and_then(platform::get_btime),
+                'C' => meta.map(platform::get_ctime),
+                _ => meta.and_then(|m| m.modified().ok()),
+            };
+            match time {
+                Some(t) => format_time_strftime(t, fmt_char),
+                None => "?".to_string(),
+            }
+        }
+        _ => return None,
+    };
+
+    Some(value)
 }
 
 fn format_time_default(time: SystemTime) -> String {
@@ -594,7 +745,13 @@ fn format_time_strftime(time: SystemTime, fmt_char: char) -> String {
     let datetime: DateTime<Local> = time.into();
 
     match fmt_char {
-        '@' => datetime.timestamp().to_string(),
+        // エポック秒（小数部付き、GNU 互換）
+        '@' => match time.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => format!("{}.{:09}", d.as_secs(), d.subsec_nanos()),
+            Err(_) => datetime.timestamp().to_string(),
+        },
+        // ISO 風の日付+時刻（GNU の %T+ 互換）
+        '+' => datetime.format("%Y-%m-%d+%H:%M:%S").to_string(),
         'H' => format!("{:02}", datetime.hour()),
         'I' => format!("{:02}", (datetime.hour() % 12).max(1)),
         'k' => format!("{:2}", datetime.hour()),
@@ -625,15 +782,35 @@ fn format_time_strftime(time: SystemTime, fmt_char: char) -> String {
     }
 }
 
+/// (デバイス番号, inode 番号, ハードリンク数) を返す。
+/// Unix は取得済みメタデータから、Windows はハンドル問い合わせで取得する。
+fn action_file_ids(ctx: &ActionContext) -> Option<(u64, u64, u64)> {
+    #[cfg(windows)]
+    {
+        // シンボリックリンクの場合はリンク自体の情報（lstat 相当）
+        platform::get_file_ids(ctx.path, ctx.symlink_metadata().is_none())
+    }
+
+    #[cfg(not(windows))]
+    {
+        ctx.metadata().map(|m| {
+            (
+                platform::get_dev(m),
+                platform::get_ino(m),
+                platform::get_nlink(m),
+            )
+        })
+    }
+}
+
 fn format_ls(ctx: &ActionContext) -> String {
     // -ls はメタデータを必要とするアクション。取得できない場合は空文字を返す。
     let Some(meta) = ctx.metadata() else {
         return format!("{}", ctx.path.display());
     };
-    let ino = platform::get_ino(meta);
+    let (_, ino, nlink) = action_file_ids(ctx).unwrap_or((0, 0, 1));
     let blocks = (meta.len() + 511) / 512;
     let mode_str = platform::format_mode_symbolic(platform::get_mode(meta), meta);
-    let nlink = platform::get_nlink(meta);
 
     let user = platform::get_user_name(platform::get_uid(meta))
         .unwrap_or_else(|| platform::get_uid(meta).to_string());
