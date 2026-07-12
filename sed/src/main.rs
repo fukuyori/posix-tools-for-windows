@@ -31,13 +31,16 @@ struct Options {
     
     // GNU拡張オプション
     in_place: bool,           // -i: インプレース編集
-    in_place_backup: Option<String>, // -i SUFFIX: バックアップサフィックス
+    in_place_backup: Option<String>, // -iSUFFIX: バックアップサフィックス
     extended_regex: bool,     // -E, -r: 拡張正規表現
     separate: bool,           // -s: ファイルを個別に処理
     unbuffered: bool,         // -u: バッファなし
     follow_symlinks: bool,    // --follow-symlinks: シンボリックリンクをたどる
     null_data: bool,          // -z: NUL区切り
-    
+    line_length: Option<usize>, // -l N: l コマンドの折り返し幅（None = デフォルト 70）
+    sandbox: bool,            // --sandbox: e/r/w 系コマンドを禁止
+    posix: bool,              // --posix: GNU拡張を抑制（受理のみ、動作は概ね共通）
+
     show_help: bool,
     show_version: bool,
 }
@@ -46,8 +49,15 @@ struct Options {
 enum Address {
     Line(usize),
     LastLine,
-    Regex(String),
-    Step(usize, usize),  // first~step
+    Regex {
+        pattern: String,
+        ignore_case: bool, // /pat/I
+        multiline: bool,   // /pat/M
+    },
+    Step(usize, usize), // first~step
+    Zero,               // 0 （0,/regexp/ 専用・GNU拡張）
+    RelOffset(usize),   // addr1,+N （GNU拡張）
+    Multiple(usize),    // addr1,~N （GNU拡張）
 }
 
 #[derive(Debug, Clone)]
@@ -58,9 +68,8 @@ enum Command {
     DeleteFirstLine,
     Print,
     PrintFirstLine,
-    PrintUnambiguous,
+    PrintUnambiguous(Option<usize>), // l [幅]
     PrintLineNum,
-    Quit,
     QuitWithCode(i32),
     QuitSilentWithCode(i32),
     Next,
@@ -80,8 +89,15 @@ enum Command {
     ReadFile(String),
     WriteFile(String),
     Block(Vec<SedCommand>),
+    /// フラット化後のブロック開始。値は「ブロックの次」の命令インデックス。
+    /// アドレスが一致しなければそこへジャンプする。
+    BlockBegin(usize),
     // GNU拡張
-    ZapPattern,    // z: パターンスペースをクリア
+    ZapPattern,             // z: パターンスペースをクリア
+    ReadLineFile(String),   // R: ファイルから1行ずつ読み込んで追加
+    WriteFirstLine(String), // W: パターンスペースの最初の行をファイルに書き込み
+    PrintFileName,          // F: 現在の入力ファイル名を出力
+    Execute(String),        // e [コマンド]: コマンド実行（空ならパターンスペースを実行）
 }
 
 #[derive(Debug, Clone, Default)]
@@ -103,13 +119,35 @@ struct SedCommand {
     command: Command,
 }
 
+/// 活性化中のアドレス範囲の状態
+#[derive(Debug, Clone)]
+struct ActiveRange {
+    /// +N / ~N / 行番号終端用に活性化時に確定した終了行（この行に達したら閉じる）
+    end_line: Option<usize>,
+}
+
 struct SedState {
     pattern_space: String,
     hold_space: String,
     line_num: usize,
     substitution_made: bool,
     append_queue: Vec<String>,
-    active_ranges: HashMap<usize, bool>,
+    active_ranges: HashMap<usize, ActiveRange>,
+    /// 0,/regexp/ の範囲を一度開始したコマンド（再開始しない）
+    zero_done: std::collections::HashSet<usize>,
+    /// w コマンド / s///w の出力先。起動後最初の書き込みで truncate し、以後追記（GNU 互換）
+    write_files: HashMap<String, WriteTarget>,
+    /// R コマンドの読み込み状態（ファイル内容と現在位置）
+    read_line_files: HashMap<String, (Vec<String>, usize)>,
+    /// F コマンド用の現在の入力ファイル名
+    current_file: std::rc::Rc<String>,
+}
+
+/// w コマンドの出力先
+enum WriteTarget {
+    Stdout,
+    Stderr,
+    File(File),
 }
 
 impl SedState {
@@ -121,6 +159,10 @@ impl SedState {
             substitution_made: false,
             append_queue: Vec::new(),
             active_ranges: HashMap::new(),
+            zero_done: std::collections::HashSet::new(),
+            write_files: HashMap::new(),
+            read_line_files: HashMap::new(),
+            current_file: std::rc::Rc::new("-".to_string()),
         }
     }
 }
@@ -128,12 +170,14 @@ impl SedState {
 struct InputLine {
     text: String,
     line_ending: &'static str,
+    /// この行の入力元ファイル名（F コマンド用）
+    file: std::rc::Rc<String>,
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    
-    let (opts, files) = match parse_args(&args) {
+
+    let (mut opts, files) = match parse_args(&args) {
         Ok(result) => result,
         Err(e) => {
             eprintln!("sed: {}", e);
@@ -148,7 +192,7 @@ fn main() {
     }
 
     if opts.show_version {
-        println!("sed (Rust版) 2.1.0");
+        println!("sed (Rust版) 2.2.0");
         println!("POSIX.1-2017 寄り + GNU/Windows 拡張");
         std::process::exit(0);
     }
@@ -194,6 +238,11 @@ fn main() {
         std::process::exit(2);
     }
 
+    // POSIX: スクリプトの最初の2文字が "#n" なら -n と同じ（GNU 4.9 も先頭2文字のみで判定）
+    if script.starts_with("#n") {
+        opts.quiet = true;
+    }
+
     let mut commands = match parse_script_at(&script) {
         Ok(cmds) => cmds,
         Err((pos, msg)) => {
@@ -202,32 +251,139 @@ fn main() {
         }
     };
     assign_command_ids(&mut commands);
-
+    let commands = flatten_commands(commands);
     let labels = build_label_index(&commands);
+
+    // 正規表現・ラベル・サンドボックスの事前検証
+    if let Err(msg) = validate_commands(&commands, &labels, &opts) {
+        eprintln!("sed: {}", msg);
+        std::process::exit(1);
+    }
 
     // glob展開
     let files = expand_globs(files);
 
+    // GNU 互換: -i は入力ファイルが必要
+    if opts.in_place && files.is_empty() {
+        eprintln!("sed: -i は標準入力に対しては使用できません（入力ファイルを指定してください）");
+        std::process::exit(2);
+    }
+
+    std::process::exit(run(&files, &commands, &labels, &opts));
+}
+
+/// 入力の処理全体。終了コードを返す。
+fn run(files: &[String], commands: &[SedCommand], labels: &HashMap<String, usize>, opts: &Options) -> i32 {
     if files.is_empty() {
-        if let Err(e) = process_stdin(&commands, &labels, &opts) {
-            eprintln!("sed: {}", format_error(&e));
-            std::process::exit(1);
+        return match process_stdin(commands, labels, opts) {
+            Ok(Some(code)) => code,
+            Ok(None) => 0,
+            Err(e) => {
+                eprintln!("sed: {}", format_error(&e));
+                1
+            }
+        };
+    }
+
+    if !opts.in_place && !opts.separate {
+        // 連続ストリーム処理: 読めないファイルは警告してスキップし、処理は続行（GNU 互換）
+        let mut lines = Vec::new();
+        let mut had_error = false;
+        for path in files {
+            match read_file_lines(path, opts) {
+                Ok(l) => lines.extend(l),
+                Err(e) => {
+                    eprintln!("sed: '{}' を読み込めません: {}", path, format_error(&e));
+                    had_error = true;
+                }
+            }
         }
-    } else if !opts.in_place && !opts.separate {
-        if let Err(e) = process_files_as_stream(&files, &commands, &labels, &opts) {
-            eprintln!("sed: {}", format_error(&e));
-            std::process::exit(1);
-        }
-    } else {
-        let mut exit_code = 0;
-        for file in &files {
-            if let Err(e) = process_file(file, &commands, &labels, &opts) {
+        let mut out = io::stdout().lock();
+        let mut state = SedState::new();
+        return match process_input_lines(&lines, commands, labels, opts, &mut out, &mut state) {
+            Ok(Some(code)) => code,
+            Ok(None) => if had_error { 1 } else { 0 },
+            Err(e) => {
+                eprintln!("sed: {}", format_error(&e));
+                1
+            }
+        };
+    }
+
+    // -i / -s: ファイルごとに個別処理
+    let mut exit_code = 0;
+    for file in files {
+        match process_file(file, commands, labels, opts) {
+            // q/Q はその時点で全体を終了する（GNU 互換）
+            Ok(Some(code)) => return code,
+            Ok(None) => {}
+            Err(e) => {
                 eprintln!("sed: '{}': {}", file, format_error(&e));
                 exit_code = 1;
             }
         }
-        std::process::exit(exit_code);
     }
+    exit_code
+}
+
+/// 実行前の静的検証: 正規表現がコンパイルできるか、分岐先ラベルが存在するか、
+/// --sandbox で禁止コマンドが使われていないか。
+fn validate_commands(commands: &[SedCommand], labels: &HashMap<String, usize>, opts: &Options) -> Result<(), String> {
+    fn check_regex(pattern: &str, ignore_case: bool, multiline: bool, opts: &Options) -> Result<(), String> {
+        build_regex(pattern, ignore_case, multiline, opts)
+            .map(|_| ())
+            .map_err(|e| format!("正規表現 '{}' が不正です: {}", pattern, e))
+    }
+
+    fn check_addr(addr: &Option<Address>, opts: &Options) -> Result<(), String> {
+        if let Some(Address::Regex { pattern, ignore_case, multiline }) = addr {
+            check_regex(pattern, *ignore_case, *multiline, opts)?;
+        }
+        Ok(())
+    }
+
+    for cmd in commands {
+        check_addr(&cmd.addr1, opts)?;
+        check_addr(&cmd.addr2, opts)?;
+
+        match &cmd.command {
+            Command::Substitute { pattern, flags, .. } => {
+                check_regex(pattern, flags.ignore_case, flags.multiline, opts)?;
+                if opts.sandbox && flags.write_file.is_some() {
+                    return Err("サンドボックスモードでは s///w は使用できません".to_string());
+                }
+            }
+            Command::Branch(l) | Command::Test(l) | Command::TestNot(l) => {
+                if !l.is_empty() && !labels.contains_key(l) {
+                    return Err(format!("ラベル '{}' が見つかりません", l));
+                }
+            }
+            Command::ReadFile(_) | Command::WriteFile(_) | Command::ReadLineFile(_)
+            | Command::WriteFirstLine(_) | Command::Execute(_)
+                if opts.sandbox =>
+            {
+                return Err("サンドボックスモードでは e/r/w/R/W コマンドは使用できません".to_string());
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// 1 ファイル分の入力行を読み込む（"-" は標準入力）
+fn read_file_lines(path: &str, opts: &Options) -> io::Result<Vec<InputLine>> {
+    if path == "-" {
+        let mut buf = Vec::new();
+        io::stdin().lock().read_to_end(&mut buf)?;
+        return Ok(decode_input_lines(&buf, opts, "-"));
+    }
+    let p = resolve_path_case_insensitive(path);
+    if p.is_dir() {
+        return Err(io::Error::new(io::ErrorKind::IsADirectory, "ディレクトリです"));
+    }
+    let mut buf = Vec::new();
+    File::open(&p)?.read_to_end(&mut buf)?;
+    Ok(decode_input_lines(&buf, opts, path))
 }
 
 fn parse_args(args: &[String]) -> Result<(Options, Vec<String>), String> {
@@ -273,21 +429,61 @@ fn parse_args(args: &[String]) -> Result<(Options, Vec<String>), String> {
             }
             // GNU拡張オプション
             "-E" | "-r" | "--regexp-extended" => opts.extended_regex = true,
-            "-i" | "--in-place" => {
-                opts.in_place = true;
-                if let Some(next) = args.get(i + 1) {
-                    if !next.starts_with('-') {
-                        opts.in_place_backup = Some(next.clone());
-                        i += 1;
-                    }
-                }
-            }
+            // GNU 互換: バックアップサフィックスは -i.bak / --in-place=.bak の
+            // 結合形式のみ。次の引数をサフィックスとして消費しない
+            // （`sed -i 's/a/b/' file` を壊さないため）。
+            "-i" | "--in-place" => opts.in_place = true,
             "-s" | "--separate" => opts.separate = true,
             "-u" | "--unbuffered" => opts.unbuffered = true,
             "-z" | "--null-data" => opts.null_data = true,
+            "-l" | "--line-length" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("オプション '-l' には引数が必要です".to_string());
+                }
+                let n: usize = args[i]
+                    .parse()
+                    .map_err(|_| format!("'-l' の引数が不正です: '{}'", args[i]))?;
+                opts.line_length = Some(n);
+            }
+            "--posix" => opts.posix = true,
+            "--sandbox" => opts.sandbox = true,
+            "--debug" => {} // 互換のため受理して無視
             "--follow-symlinks" => opts.follow_symlinks = true,
             "--help" => opts.show_help = true,
             "--version" => opts.show_version = true,
+            // --expression=SCRIPT / --file=FILE
+            s if s.starts_with("--expression=") => {
+                opts.expressions.push(s["--expression=".len()..].to_string());
+                has_script = true;
+            }
+            "--expression" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("オプション '--expression' には引数が必要です".to_string());
+                }
+                opts.expressions.push(args[i].clone());
+                has_script = true;
+            }
+            s if s.starts_with("--file=") => {
+                opts.script_files.push(s["--file=".len()..].to_string());
+                has_script = true;
+            }
+            "--file" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("オプション '--file' には引数が必要です".to_string());
+                }
+                opts.script_files.push(args[i].clone());
+                has_script = true;
+            }
+            s if s.starts_with("--line-length=") => {
+                let v = &s["--line-length=".len()..];
+                let n: usize = v
+                    .parse()
+                    .map_err(|_| format!("'--line-length' の引数が不正です: '{}'", v))?;
+                opts.line_length = Some(n);
+            }
             // -e付きの値
             s if s.starts_with("-e") && s.len() > 2 => {
                 opts.expressions.push(s[2..].to_string());
@@ -427,15 +623,23 @@ GNU拡張オプション:
                  拡張正規表現を使用（POSIXのデフォルトは基本正規表現）
   -i[SUFFIX], --in-place[=SUFFIX]
                  ファイルをその場で編集（SUFFIXがあればバックアップ作成）
+                 ※ サフィックスは -i.bak のような結合形式のみ（GNU互換）
   -s, --separate ファイルを連続ストリームとしてではなく個別に処理
   -u, --unbuffered
                  入力ファイルから最小限のデータを読み込み、より頻繁に出力バッファをフラッシュ
   -z, --null-data
                  改行の代わりにNUL文字で行を区切る
+  -l N, --line-length=N
+                 l コマンドの折り返し幅（デフォルト 70、0 で折り返しなし）
+      --posix    POSIX 準拠モード（受理のみ）
+      --sandbox  e/r/w/R/W コマンドを禁止する
+      --debug    互換のため受理（無視）
       --follow-symlinks
                  -i使用時にシンボリックリンクをたどる
       --help     このヘルプを表示して終了
       --version  バージョン情報を表示して終了
+
+スクリプトの最初の2文字が #n の場合は -n と同じ動作になります（POSIX）。
 
 -e または -f がない場合、最初の非オプション引数がsedスクリプトとして使用されます。
 残りの引数は入力ファイル名として解釈されます。ファイル指定がない場合は標準入力を読み込みます。
@@ -445,17 +649,23 @@ Windows では `*`, `?`, `[]` を内部で展開します。先頭 `.` は明示
   number         指定行番号
   $              最終行
   /regexp/       正規表現にマッチする行
+  /regexp/I      大文字小文字を区別しない（GNU拡張、M でマルチライン）
   first~step     first行目から、step行ごと（GNU拡張）
+  0,/regexp/     1行目から終端判定を行う範囲（GNU拡張）
+  addr,+N        addr から N 行後まで（GNU拡張）
+  addr,~N        addr から次の N の倍数行まで（GNU拡張）
 
 コマンド:
   s/regexp/replacement/flags
-                 置換（flags: g=全置換, p=出力, i=大小無視, N=N番目のみ, w FILE=ファイル出力）
-  y/src/dst/     文字変換（trに似る）
+                 置換（flags: g=全置換, p=出力, i=大小無視, m=マルチライン,
+                       N=N番目（Ng で N番目以降すべて）, w FILE=ファイル出力）
+                 replacement では \1-\9, &, \U \L \u \l \E（大小変換）が使える
+  y/src/dst/     文字変換（1対1、'-' はリテラル）
   d              パターンスペースを削除
-  D              パターンスペースの最初の行を削除
+  D              パターンスペースの最初の行を削除しサイクルを再開
   p              パターンスペースを出力
   P              パターンスペースの最初の行を出力
-  l              パターンスペースを曖昧さなく出力
+  l [width]      パターンスペースを曖昧さなく出力（width 文字で折り返し）
   =              行番号を出力
   n              次の行を読み込み
   N              次の行をパターンスペースに追加
@@ -464,17 +674,25 @@ Windows では `*`, `?`, `[]` を内部で展開します。先頭 `.` は明示
   h H            パターンスペースをホールドスペースにコピー/追加
   g G            ホールドスペースをパターンスペースにコピー/追加
   x              パターンスペースとホールドスペースを交換
-  a\text         textを後に追加
+  a\text         textを後に追加（行末 \ で複数行継続可）
   i\text         textを前に挿入
-  c\text         パターンスペースをtextで置換
+  c\text         パターンスペースをtextで置換（範囲では最終行に一度だけ出力）
   r file         ファイルの内容を追加
+  R file         ファイルから1行ずつ読み込んで追加（GNU拡張）
   w file         パターンスペースをファイルに書き込み
+                 （/dev/stdout, /dev/stderr も指定可）
+  W file         パターンスペースの最初の行をファイルに書き込み（GNU拡張）
+  F              現在の入力ファイル名を出力（GNU拡張）
+  e [command]    コマンドを実行（GNU拡張、引数なしはパターンスペースを実行）
   b [label]      ラベルに分岐
   t [label]      置換成功時にラベルに分岐
   T [label]      置換失敗時にラベルに分岐（GNU拡張）
   :label         ラベル定義
   {{ commands }}   コマンドのグループ化
   z              パターンスペースをクリア（GNU拡張）
+  v [version]    バージョン要求（受理のみ、GNU拡張）
+
+正規表現では \< \>（単語境界）も使えます。
 
 終了ステータス:
   0  正常終了
@@ -631,7 +849,7 @@ fn normalize_empty_regexes(commands: &mut [SedCommand]) -> Result<(), String> {
     }
 
     fn normalize_address(addr: &mut Option<Address>, last_regex: &mut Option<String>) -> Result<(), String> {
-        if let Some(Address::Regex(pattern)) = addr {
+        if let Some(Address::Regex { pattern, .. }) = addr {
             if pattern.is_empty() {
                 let reused = last_regex
                     .clone()
@@ -670,11 +888,35 @@ fn parse_sed_command(chars: &[char], pos: &mut usize) -> Result<SedCommand, Stri
     skip_ws(chars, pos);
     let addr1 = parse_address(chars, pos)?;
     skip_ws(chars, pos);
-    let addr2 = if *pos < chars.len() && chars[*pos] == ',' {
+    let addr2 = if addr1.is_some() && *pos < chars.len() && chars[*pos] == ',' {
         *pos += 1;
         skip_ws(chars, pos);
-        Some(parse_address(chars, pos)?.unwrap_or(Address::LastLine))
+        // GNU拡張: addr1,+N（N行後まで）と addr1,~N（次のNの倍数行まで）
+        if *pos < chars.len() && (chars[*pos] == '+' || chars[*pos] == '~') {
+            let rel = chars[*pos] == '+';
+            *pos += 1;
+            let mut s = String::new();
+            while *pos < chars.len() && chars[*pos].is_ascii_digit() {
+                s.push(chars[*pos]); *pos += 1;
+            }
+            let n: usize = s.parse().map_err(|_| "無効な数値です".to_string())?;
+            if !rel && n == 0 {
+                return Err("~ の値は 1 以上でなければなりません".to_string());
+            }
+            Some(if rel { Address::RelOffset(n) } else { Address::Multiple(n) })
+        } else {
+            Some(parse_address(chars, pos)?.unwrap_or(Address::LastLine))
+        }
     } else { None };
+
+    // 0,/regexp/ の検証: アドレス 0 は正規表現終端との組み合わせのみ有効
+    if matches!(addr1, Some(Address::Zero)) {
+        match &addr2 {
+            Some(Address::Regex { .. }) => {}
+            _ => return Err("行番号 0 は 0,/regexp/ の形式でのみ使用できます".to_string()),
+        }
+    }
+
     skip_ws(chars, pos);
     let negate = if *pos < chars.len() && chars[*pos] == '!' {
         *pos += 1; skip_ws(chars, pos); true
@@ -694,9 +936,6 @@ fn parse_address(chars: &[char], pos: &mut usize) -> Result<Option<Address>, Str
             s.push(chars[*pos]); *pos += 1;
         }
         let n: usize = s.parse().map_err(|_| "無効な行番号です")?;
-        if n == 0 {
-            return Err("行番号は 1 以上でなければなりません".to_string());
-        }
         // GNU拡張: first~step
         if *pos < chars.len() && chars[*pos] == '~' {
             *pos += 1;
@@ -708,7 +947,14 @@ fn parse_address(chars: &[char], pos: &mut usize) -> Result<Option<Address>, Str
             if step == 0 {
                 return Err("ステップ値は 1 以上でなければなりません".to_string());
             }
+            if n == 0 {
+                return Err("行番号は 1 以上でなければなりません".to_string());
+            }
             return Ok(Some(Address::Step(n, step)));
+        }
+        if n == 0 {
+            // 0,/regexp/ 用（parse_sed_command 側で検証する）
+            return Ok(Some(Address::Zero));
         }
         return Ok(Some(Address::Line(n)));
     }
@@ -721,8 +967,18 @@ fn parse_address(chars: &[char], pos: &mut usize) -> Result<Option<Address>, Str
             if *pos >= chars.len() { return Err("区切り文字がありません".to_string()); }
             let d = chars[*pos]; *pos += 1; d
         } else { *pos += 1; '/' };
-        let pat = read_delim(chars, pos, delim)?;
-        return Ok(Some(Address::Regex(pat)));
+        let pattern = read_delim(chars, pos, delim)?;
+        // GNU拡張: アドレス正規表現の I（大小無視）/ M（マルチライン）フラグ
+        let mut ignore_case = false;
+        let mut multiline = false;
+        while *pos < chars.len() {
+            match chars[*pos] {
+                'I' => { ignore_case = true; *pos += 1; }
+                'M' => { multiline = true; *pos += 1; }
+                _ => break,
+            }
+        }
+        return Ok(Some(Address::Regex { pattern, ignore_case, multiline }));
     }
     Ok(None)
 }
@@ -738,7 +994,12 @@ fn parse_cmd(chars: &[char], pos: &mut usize) -> Result<Command, String> {
         'D' => Ok(Command::DeleteFirstLine),
         'p' => Ok(Command::Print),
         'P' => Ok(Command::PrintFirstLine),
-        'l' => Ok(Command::PrintUnambiguous),
+        'l' => {
+            skip_ws(chars, pos);
+            let width = read_optional_number(chars, pos)?.map(|n| n.max(0) as usize);
+            ensure_command_terminator(chars, pos, "l")?;
+            Ok(Command::PrintUnambiguous(width))
+        }
         '=' => Ok(Command::PrintLineNum),
         'q' => parse_quit(chars, pos, false),
         'Q' => parse_quit(chars, pos, true),
@@ -774,14 +1035,43 @@ fn parse_cmd(chars: &[char], pos: &mut usize) -> Result<Command, String> {
                 Ok(Command::ReadFile(f)) 
             } 
         }
-        'w' => { 
-            skip_ws(chars, pos); 
+        'w' => {
+            skip_ws(chars, pos);
             let f = read_fname(chars, pos);
-            if f.is_empty() { 
-                Err("ファイル名が必要です".to_string()) 
-            } else { 
-                Ok(Command::WriteFile(f)) 
-            } 
+            if f.is_empty() {
+                Err("ファイル名が必要です".to_string())
+            } else {
+                Ok(Command::WriteFile(f))
+            }
+        }
+        'R' => {
+            skip_ws(chars, pos);
+            let f = read_fname(chars, pos);
+            if f.is_empty() {
+                Err("ファイル名が必要です".to_string())
+            } else {
+                Ok(Command::ReadLineFile(f))
+            }
+        }
+        'W' => {
+            skip_ws(chars, pos);
+            let f = read_fname(chars, pos);
+            if f.is_empty() {
+                Err("ファイル名が必要です".to_string())
+            } else {
+                Ok(Command::WriteFirstLine(f))
+            }
+        }
+        'F' => Ok(Command::PrintFileName),
+        'e' => {
+            skip_ws(chars, pos);
+            Ok(Command::Execute(read_fname(chars, pos)))
+        }
+        'v' => {
+            // GNU拡張: バージョン要求。引数は受理して無視する
+            skip_ws(chars, pos);
+            let _ = read_label(chars, pos);
+            Ok(Command::Block(Vec::new()))
         }
         '{' => {
             let mut blk = Vec::new();
@@ -805,7 +1095,7 @@ fn parse_quit(chars: &[char], pos: &mut usize, silent: bool) -> Result<Command, 
     let code = read_optional_number(chars, pos)?;
     ensure_command_terminator(chars, pos, "q")?;
     match (silent, code) {
-        (false, None) => Ok(Command::Quit),
+        (false, None) => Ok(Command::QuitWithCode(0)),
         (false, Some(code)) => Ok(Command::QuitWithCode(code)),
         (true, None) => Ok(Command::QuitSilentWithCode(0)),
         (true, Some(code)) => Ok(Command::QuitSilentWithCode(code)),
@@ -886,15 +1176,14 @@ fn parse_trans(chars: &[char], pos: &mut usize) -> Result<Command, String> {
     Ok(Command::Translate { src, dst })
 }
 
+/// y コマンドの文字列をエスケープ解決して文字列にする。
+/// GNU sed 互換: '-' はリテラル（tr のような範囲展開は行わない）。
 fn expand_range(s: &str) -> Vec<char> {
     let mut r = Vec::new();
     let cs: Vec<char> = s.chars().collect();
     let mut i = 0;
     while i < cs.len() {
-        if i + 2 < cs.len() && cs[i + 1] == '-' {
-            for c in cs[i]..=cs[i + 2] { r.push(c); }
-            i += 3;
-        } else if cs[i] == '\\' && i + 1 < cs.len() {
+        if cs[i] == '\\' && i + 1 < cs.len() {
             i += 1;
             r.push(match cs[i] { 'n' => '\n', 't' => '\t', 'r' => '\r', c => c });
             i += 1;
@@ -953,17 +1242,67 @@ fn read_text(chars: &[char], pos: &mut usize) -> String {
     if *pos < chars.len() && chars[*pos] == '\\' { *pos += 1; }
     if *pos < chars.len() && chars[*pos] == '\n' { *pos += 1; }
     let mut t = String::new();
-    while *pos < chars.len() && chars[*pos] != '\n' {
-        t.push(chars[*pos]); *pos += 1;
+    while *pos < chars.len() {
+        let c = chars[*pos];
+        if c == '\n' { break; }
+        if c == '\\' {
+            *pos += 1;
+            if *pos >= chars.len() { break; } // 末尾の裸のバックスラッシュは無視
+            let n = chars[*pos];
+            *pos += 1;
+            match n {
+                // 行末のバックスラッシュ + 改行はテキストの継続（POSIX）
+                '\n' => t.push('\n'),
+                'n' => t.push('\n'),
+                't' => t.push('\t'),
+                'r' => t.push('\r'),
+                other => t.push(other), // \\ → \ を含む
+            }
+        } else {
+            t.push(c);
+            *pos += 1;
+        }
     }
     t
+}
+
+/// パース木のブロックをフラットな命令列に変換する。
+/// これによりラベル分岐（ブロック内外への b/t/T）と D の全体再開が正しく動く。
+fn flatten_commands(commands: Vec<SedCommand>) -> Vec<SedCommand> {
+    fn rec(commands: Vec<SedCommand>, out: &mut Vec<SedCommand>) {
+        for mut cmd in commands {
+            if matches!(cmd.command, Command::Block(_)) {
+                let Command::Block(inner) =
+                    std::mem::replace(&mut cmd.command, Command::BlockBegin(0))
+                else { unreachable!() };
+                // アドレスなしの空ブロック（v コマンド等）は完全に無視する
+                if inner.is_empty() && cmd.addr1.is_none() && cmd.addr2.is_none() && !cmd.negate {
+                    continue;
+                }
+                let begin = out.len();
+                out.push(cmd);
+                rec(inner, out);
+                let end = out.len();
+                if let Command::BlockBegin(e) = &mut out[begin].command {
+                    *e = end;
+                }
+            } else {
+                out.push(cmd);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    rec(commands, &mut out);
+    out
 }
 
 fn build_label_index(commands: &[SedCommand]) -> HashMap<String, usize> {
     let mut m = HashMap::new();
     for (i, cmd) in commands.iter().enumerate() {
-        if let Command::Label(n) = &cmd.command { m.insert(n.clone(), i); }
-        if let Command::Block(b) = &cmd.command { m.extend(build_label_index(b)); }
+        if let Command::Label(n) = &cmd.command {
+            m.insert(n.clone(), i);
+        }
     }
     m
 }
@@ -983,54 +1322,23 @@ fn assign_command_ids(commands: &mut [SedCommand]) {
     assign(commands, &mut next_id);
 }
 
-fn process_stdin(commands: &[SedCommand], labels: &HashMap<String, usize>, opts: &Options) -> io::Result<()> {
+fn process_stdin(commands: &[SedCommand], labels: &HashMap<String, usize>, opts: &Options) -> io::Result<Option<i32>> {
     let mut buf = Vec::new();
     io::stdin().lock().read_to_end(&mut buf)?;
-    let lines = decode_input_lines(&buf, opts);
+    let lines = decode_input_lines(&buf, opts, "-");
     let mut out = io::stdout().lock();
     let mut state = SedState::new();
     process_input_lines(&lines, commands, labels, opts, &mut out, &mut state)
 }
 
-fn process_files_as_stream(paths: &[String], commands: &[SedCommand], labels: &HashMap<String, usize>, opts: &Options) -> io::Result<()> {
-    let mut lines = Vec::new();
-    for path in paths {
-        if path == "-" {
-            let mut buf = Vec::new();
-            io::stdin().lock().read_to_end(&mut buf)?;
-            lines.extend(decode_input_lines(&buf, opts));
-            continue;
-        }
-
-        let p = resolve_path_case_insensitive(path);
-        if p.is_dir() {
-            return Err(io::Error::new(io::ErrorKind::IsADirectory, "ディレクトリです"));
-        }
-
-        let mut buf = Vec::new();
-        File::open(&p)?.read_to_end(&mut buf)?;
-        lines.extend(decode_input_lines(&buf, opts));
-    }
-
-    let mut out = io::stdout().lock();
-    let mut state = SedState::new();
-    process_input_lines(&lines, commands, labels, opts, &mut out, &mut state)
-}
-
-fn process_file(path: &str, commands: &[SedCommand], labels: &HashMap<String, usize>, opts: &Options) -> io::Result<()> {
+fn process_file(path: &str, commands: &[SedCommand], labels: &HashMap<String, usize>, opts: &Options) -> io::Result<Option<i32>> {
     // "-" は標準入力
     if path == "-" {
         return process_stdin(commands, labels, opts);
     }
 
+    let lines = read_file_lines(path, opts)?;
     let p = resolve_path_case_insensitive(path);
-    if p.is_dir() { 
-        return Err(io::Error::new(io::ErrorKind::IsADirectory, "ディレクトリです")); 
-    }
-
-    let mut buf = Vec::new();
-    File::open(&p)?.read_to_end(&mut buf)?;
-    let lines = decode_input_lines(&buf, opts);
 
     if opts.in_place {
         if let Some(ref suf) = opts.in_place_backup {
@@ -1039,28 +1347,30 @@ fn process_file(path: &str, commands: &[SedCommand], labels: &HashMap<String, us
         }
         let mut out = Vec::new();
         let mut state = SedState::new();
-        process_input_lines(&lines, commands, labels, opts, &mut out, &mut state)?;
+        // q/Q でもここまでの出力はファイルに書き戻す（GNU 互換）
+        let quit = process_input_lines(&lines, commands, labels, opts, &mut out, &mut state)?;
         File::create(&p)?.write_all(&out)?;
+        Ok(quit)
     } else {
         let mut out = io::stdout().lock();
         let mut state = SedState::new();
-        process_input_lines(&lines, commands, labels, opts, &mut out, &mut state)?;
+        process_input_lines(&lines, commands, labels, opts, &mut out, &mut state)
     }
-    Ok(())
 }
 
-fn decode_input_lines(bytes: &[u8], opts: &Options) -> Vec<InputLine> {
+fn decode_input_lines(bytes: &[u8], opts: &Options, file: &str) -> Vec<InputLine> {
+    let file = std::rc::Rc::new(file.to_string());
     let content = decode_to_utf8(bytes);
     if opts.null_data {
         content
             .split('\0')
-            .map(|line| InputLine { text: line.to_string(), line_ending: "\0" })
+            .map(|line| InputLine { text: line.to_string(), line_ending: "\0", file: file.clone() })
             .collect()
     } else {
         let line_ending = detect_line_ending(&content);
         content
             .lines()
-            .map(|line| InputLine { text: line.to_string(), line_ending })
+            .map(|line| InputLine { text: line.to_string(), line_ending, file: file.clone() })
             .collect()
     }
 }
@@ -1077,17 +1387,19 @@ fn detect_line_ending(content: &str) -> &'static str {
 
 #[cfg(test)]
 fn process_lines<W: Write>(lines: &[&str], commands: &[SedCommand], labels: &HashMap<String, usize>,
-                           opts: &Options, w: &mut W, _line_ending: &str) -> io::Result<()> {
+                           opts: &Options, w: &mut W, _line_ending: &str) -> io::Result<Option<i32>> {
+    let file = std::rc::Rc::new("-".to_string());
     let input_lines: Vec<InputLine> = lines
         .iter()
-        .map(|line| InputLine { text: (*line).to_string(), line_ending: "\n" })
+        .map(|line| InputLine { text: (*line).to_string(), line_ending: "\n", file: file.clone() })
         .collect();
     let mut state = SedState::new();
     process_input_lines(&input_lines, commands, labels, opts, w, &mut state)
 }
 
+/// 1 サイクル分の入力処理。q/Q による終了コードを Some で返す。
 fn process_input_lines<W: Write>(lines: &[InputLine], commands: &[SedCommand], labels: &HashMap<String, usize>,
-                                 opts: &Options, w: &mut W, state: &mut SedState) -> io::Result<()> {
+                                 opts: &Options, w: &mut W, state: &mut SedState) -> io::Result<Option<i32>> {
     let total = lines.len();
     let mut iter = lines.iter().enumerate().peekable();
 
@@ -1096,32 +1408,60 @@ fn process_input_lines<W: Write>(lines: &[InputLine], commands: &[SedCommand], l
         state.pattern_space = line.text.clone();
         state.substitution_made = false;
         state.append_queue.clear();
+        state.current_file = line.file.clone();
         let is_last = idx + 1 == total;
         let mut line_ending = line.line_ending;
 
-        let result = exec_cmds(commands, state, labels, opts, w, &mut iter, is_last, &mut line_ending)?;
+        loop {
+            let result = exec_cmds(commands, state, labels, opts, w, &mut iter, is_last, &mut line_ending)?;
 
-        match result {
-            ExecResult::Continue => {
-                if !opts.quiet { write!(w, "{}{}", state.pattern_space, line_ending)?; }
-                for t in &state.append_queue { write!(w, "{}{}", t, line_ending)?; }
+            match result {
+                ExecResult::Restart => {
+                    // D: 新しい行を読まずにサイクルを再開（追加テキストは先に吐き出す）
+                    flush_append_queue(state, w, line_ending)?;
+                    continue;
+                }
+                ExecResult::Continue => {
+                    if !opts.quiet { write!(w, "{}{}", state.pattern_space, line_ending)?; }
+                    flush_append_queue(state, w, line_ending)?;
+                }
+                ExecResult::Delete => {
+                    flush_append_queue(state, w, line_ending)?;
+                }
+                ExecResult::Quit(code) => {
+                    if !opts.quiet { write!(w, "{}{}", state.pattern_space, line_ending)?; }
+                    flush_append_queue(state, w, line_ending)?;
+                    return Ok(Some(code));
+                }
+                ExecResult::QuitSilent(code) => return Ok(Some(code)),
+                ExecResult::EndOfInput => return Ok(None),
             }
-            ExecResult::Delete => {
-                for t in &state.append_queue { write!(w, "{}{}", t, line_ending)?; }
-            }
-            ExecResult::Quit => {
-                if !opts.quiet { write!(w, "{}{}", state.pattern_space, line_ending)?; }
-                for t in &state.append_queue { write!(w, "{}{}", t, line_ending)?; }
-                break;
-            }
-            ExecResult::QuitSilent => break,
+            break;
         }
+    }
+    Ok(None)
+}
+
+fn flush_append_queue<W: Write>(state: &mut SedState, w: &mut W, line_ending: &str) -> io::Result<()> {
+    for t in std::mem::take(&mut state.append_queue) {
+        write!(w, "{}{}", t, line_ending)?;
     }
     Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum ExecResult { Continue, Delete, Quit, QuitSilent }
+enum ExecResult {
+    Continue,
+    Delete,
+    /// D: 新しい行を読まずにサイクルを再実行
+    Restart,
+    /// q [code]: パターンスペースを出力して終了
+    Quit(i32),
+    /// Q [code]: 出力せずに終了
+    QuitSilent(i32),
+    /// n が入力の終端に達した（正常終了扱い）
+    EndOfInput,
+}
 
 fn exec_cmds<'a, W, I>(commands: &[SedCommand], state: &mut SedState, labels: &HashMap<String, usize>,
                        opts: &Options, w: &mut W, iter: &mut std::iter::Peekable<I>, mut is_last: bool,
@@ -1130,7 +1470,16 @@ where W: Write, I: Iterator<Item = (usize, &'a InputLine)> {
     let mut ci = 0;
     while ci < commands.len() {
         let cmd = &commands[ci];
-        if !addr_match(cmd, state, is_last, opts) { ci += 1; continue; }
+
+        // ブロック開始: アドレス不一致ならブロックの外へジャンプ
+        if let Command::BlockBegin(end) = &cmd.command {
+            let (matched, _) = addr_match(cmd, state, is_last, opts);
+            ci = if matched { ci + 1 } else { *end };
+            continue;
+        }
+
+        let (matched, range_end) = addr_match(cmd, state, is_last, opts);
+        if !matched { ci += 1; continue; }
 
         match &cmd.command {
             Command::Substitute { pattern, replacement, flags } => {
@@ -1139,62 +1488,64 @@ where W: Write, I: Iterator<Item = (usize, &'a InputLine)> {
                 if ok {
                     state.substitution_made = true;
                     if flags.print { write!(w, "{}{}", state.pattern_space, *line_ending)?; }
-                    if let Some(ref f) = flags.write_file { append_file(f, &state.pattern_space, line_ending)?; }
+                    if let Some(ref f) = flags.write_file {
+                        let text = state.pattern_space.clone();
+                        write_to_file(state, f, &text, line_ending)?;
+                    }
                 }
             }
-            Command::Translate { src, dst } => { 
-                state.pattern_space = translate(&state.pattern_space, src, dst); 
+            Command::Translate { src, dst } => {
+                state.pattern_space = translate(&state.pattern_space, src, dst);
             }
             Command::Delete => return Ok(ExecResult::Delete),
             Command::DeleteFirstLine => {
                 if let Some(p) = state.pattern_space.find('\n') {
                     state.pattern_space = state.pattern_space[p + 1..].to_string();
-                    ci = 0; continue;
+                    return Ok(ExecResult::Restart);
                 } else { return Ok(ExecResult::Delete); }
             }
             Command::Print => { write!(w, "{}{}", state.pattern_space, *line_ending)?; }
-            Command::PrintFirstLine => { 
-                write!(w, "{}{}", state.pattern_space.lines().next().unwrap_or(""), *line_ending)?; 
+            Command::PrintFirstLine => {
+                write!(w, "{}{}", state.pattern_space.lines().next().unwrap_or(""), *line_ending)?;
             }
-            Command::PrintUnambiguous => { 
-                write!(w, "{}${}", esc_unambig(&state.pattern_space), *line_ending)?; 
+            Command::PrintUnambiguous(width) => {
+                let wrap = width.or(opts.line_length).unwrap_or(70);
+                write!(w, "{}{}", format_unambiguous(&state.pattern_space, wrap), *line_ending)?;
             }
             Command::PrintLineNum => { write!(w, "{}{}", state.line_num, *line_ending)?; }
-            Command::Quit => return Ok(ExecResult::Quit),
-            Command::QuitWithCode(c) => {
-                if !opts.quiet { write!(w, "{}{}", state.pattern_space, *line_ending)?; }
-                for t in &state.append_queue { write!(w, "{}{}", t, *line_ending)?; }
-                std::process::exit(*c);
-            }
-            Command::QuitSilentWithCode(c) => std::process::exit(*c),
+            Command::QuitWithCode(c) => return Ok(ExecResult::Quit(*c)),
+            Command::QuitSilentWithCode(c) => return Ok(ExecResult::QuitSilent(*c)),
             Command::Next => {
                 if !opts.quiet { write!(w, "{}{}", state.pattern_space, *line_ending)?; }
-                if let Some((i, l)) = iter.next() {
-                    state.line_num = i + 1;
+                flush_append_queue(state, w, line_ending)?;
+                if let Some((_, l)) = iter.next() {
+                    state.line_num += 1;
                     state.pattern_space = l.text.clone();
+                    state.current_file = l.file.clone();
                     is_last = iter.peek().is_none();
                     *line_ending = l.line_ending;
                 }
-                else { return Ok(ExecResult::QuitSilent); }
+                else { return Ok(ExecResult::EndOfInput); }
             }
             Command::NextAppend => {
-                if let Some((i, l)) = iter.next() {
-                    state.line_num = i + 1;
+                if let Some((_, l)) = iter.next() {
+                    state.line_num += 1;
                     state.pattern_space.push('\n');
                     state.pattern_space.push_str(&l.text);
+                    state.current_file = l.file.clone();
                     is_last = iter.peek().is_none();
                     *line_ending = l.line_ending;
-                } else { return Ok(ExecResult::Quit); }
+                } else { return Ok(ExecResult::Quit(0)); }
             }
             Command::HoldReplace => { state.hold_space = state.pattern_space.clone(); }
-            Command::HoldAppend => { 
-                state.hold_space.push('\n'); 
-                state.hold_space.push_str(&state.pattern_space); 
+            Command::HoldAppend => {
+                state.hold_space.push('\n');
+                state.hold_space.push_str(&state.pattern_space);
             }
             Command::GetReplace => { state.pattern_space = state.hold_space.clone(); }
-            Command::GetAppend => { 
-                state.pattern_space.push('\n'); 
-                state.pattern_space.push_str(&state.hold_space); 
+            Command::GetAppend => {
+                state.pattern_space.push('\n');
+                state.pattern_space.push_str(&state.hold_space);
             }
             Command::Exchange => { std::mem::swap(&mut state.pattern_space, &mut state.hold_space); }
             Command::ZapPattern => { state.pattern_space.clear(); }
@@ -1219,54 +1570,153 @@ where W: Write, I: Iterator<Item = (usize, &'a InputLine)> {
             Command::Label(_) => {}
             Command::Append(t) => { state.append_queue.push(t.clone()); }
             Command::Insert(t) => { write!(w, "{}{}", t, *line_ending)?; }
-            Command::Change(t) => { write!(w, "{}{}", t, *line_ending)?; return Ok(ExecResult::Delete); }
-            Command::ReadFile(f) => { 
-                if let Ok(c) = fs::read_to_string(resolve_path_case_insensitive(f)) { 
-                    state.append_queue.push(c.trim_end().to_string()); 
-                } 
+            Command::Change(t) => {
+                // 範囲アドレスでは範囲の最終行で一度だけテキストを出力する（POSIX）
+                if range_end {
+                    write!(w, "{}{}", t, *line_ending)?;
+                }
+                return Ok(ExecResult::Delete);
             }
-            Command::WriteFile(f) => { append_file(f, &state.pattern_space, line_ending)?; }
-            Command::Block(b) => {
-                let r = exec_cmds(b, state, labels, opts, w, iter, is_last, line_ending)?;
-                if r != ExecResult::Continue { return Ok(r); }
+            Command::ReadFile(f) => {
+                if let Ok(c) = fs::read_to_string(resolve_path_case_insensitive(f)) {
+                    state.append_queue.push(c.trim_end_matches(['\r', '\n']).to_string());
+                }
             }
+            Command::WriteFile(f) => {
+                let text = state.pattern_space.clone();
+                write_to_file(state, f, &text, line_ending)?;
+            }
+            Command::ReadLineFile(f) => {
+                // R: 呼び出しごとにファイルから1行読み込んで追加（尽きたら何もしない）
+                if !state.read_line_files.contains_key(f) {
+                    let lines: Vec<String> = fs::read_to_string(resolve_path_case_insensitive(f))
+                        .map(|c| c.lines().map(str::to_string).collect())
+                        .unwrap_or_default();
+                    state.read_line_files.insert(f.clone(), (lines, 0));
+                }
+                if let Some((lines, idx)) = state.read_line_files.get_mut(f) {
+                    if *idx < lines.len() {
+                        state.append_queue.push(lines[*idx].clone());
+                        *idx += 1;
+                    }
+                }
+            }
+            Command::WriteFirstLine(f) => {
+                let text = state.pattern_space.lines().next().unwrap_or("").to_string();
+                write_to_file(state, f, &text, line_ending)?;
+            }
+            Command::PrintFileName => {
+                write!(w, "{}{}", state.current_file, *line_ending)?;
+            }
+            Command::Execute(cmdline) => {
+                if cmdline.is_empty() {
+                    // パターンスペースをコマンドとして実行し、出力で置き換える
+                    let output = shell_exec(&state.pattern_space);
+                    state.pattern_space = output.trim_end_matches(['\r', '\n']).to_string();
+                } else {
+                    // コマンドを実行して出力を先に流す
+                    let output = shell_exec(cmdline);
+                    w.write_all(output.as_bytes())?;
+                    if !output.is_empty() && !output.ends_with('\n') {
+                        write!(w, "{}", *line_ending)?;
+                    }
+                }
+            }
+            Command::Block(_) | Command::BlockBegin(_) => unreachable!("フラット化済み"),
         }
         ci += 1;
     }
     Ok(ExecResult::Continue)
 }
 
-fn addr_match(cmd: &SedCommand, state: &mut SedState, is_last: bool, opts: &Options) -> bool {
-    let m = match (&cmd.addr1, &cmd.addr2) {
-        (None, None) => true,
-        (None, Some(a)) => single_match(a, state.line_num, is_last, &state.pattern_space, opts),
-        (Some(a), None) => single_match(a, state.line_num, is_last, &state.pattern_space, opts),
+/// e コマンド用のシェル実行
+fn shell_exec(cmdline: &str) -> String {
+    use std::process::Command as ProcCommand;
+
+    #[cfg(windows)]
+    let output = ProcCommand::new("cmd").arg("/C").arg(cmdline).output();
+    #[cfg(not(windows))]
+    let output = ProcCommand::new("sh").arg("-c").arg(cmdline).output();
+
+    match output {
+        Ok(o) => decode_to_utf8(&o.stdout),
+        Err(_) => String::new(),
+    }
+}
+
+/// アドレスの一致判定。
+/// 戻り値は (一致したか, 範囲の最終行か)。範囲の最終行フラグは `c` コマンドが
+/// テキストを一度だけ出力するために使う（単一アドレス・無アドレスでは常に true）。
+fn addr_match(cmd: &SedCommand, state: &mut SedState, is_last: bool, opts: &Options) -> (bool, bool) {
+    let ln = state.line_num;
+    let (m, range_end) = match (&cmd.addr1, &cmd.addr2) {
+        (None, None) => (true, true),
+        (None, Some(a)) | (Some(a), None) => (
+            single_match(a, ln, is_last, &state.pattern_space, opts),
+            true,
+        ),
         (Some(start), Some(end)) => {
-            let was_active = state.active_ranges.get(&cmd.id).copied().unwrap_or(false);
-            if was_active {
-                let end_matched = single_match(end, state.line_num, is_last, &state.pattern_space, opts);
-                if end_matched {
+            if let Some(active) = state.active_ranges.get(&cmd.id).cloned() {
+                let closes = range_end_reached(end, &active, ln, is_last, &state.pattern_space, opts);
+                if closes {
                     state.active_ranges.remove(&cmd.id);
                 }
-                true
-            } else if single_match(start, state.line_num, is_last, &state.pattern_space, opts) {
-                if range_continues_after_start(end, state.line_num, is_last) {
-                    state.active_ranges.insert(cmd.id, true);
-                }
-                true
+                (true, closes || is_last)
             } else {
-                false
+                let start_matches = match start {
+                    // 0,/re/: 1行目の手前から範囲が始まる（一度だけ）
+                    Address::Zero => !state.zero_done.contains(&cmd.id),
+                    a => single_match(a, ln, is_last, &state.pattern_space, opts),
+                };
+                if start_matches {
+                    if matches!(start, Address::Zero) {
+                        state.zero_done.insert(cmd.id);
+                        // 終端の正規表現を「この行から」判定する（通常範囲との違い）
+                        let closes = single_match(end, ln, is_last, &state.pattern_space, opts);
+                        if !closes {
+                            state.active_ranges.insert(cmd.id, ActiveRange { end_line: None });
+                        }
+                        (true, closes || is_last)
+                    } else {
+                        let end_line = range_end_line_hint(end, ln);
+                        let closes = match (end, end_line) {
+                            (_, Some(el)) => ln >= el,
+                            (Address::LastLine, _) => is_last,
+                            _ => false, // 正規表現終端は次の行から判定
+                        };
+                        if !closes {
+                            state.active_ranges.insert(cmd.id, ActiveRange { end_line });
+                        }
+                        (true, closes || is_last)
+                    }
+                } else {
+                    (false, false)
+                }
             }
         }
     };
-    if cmd.negate { !m } else { m }
+    if cmd.negate { (!m, true) } else { (m, range_end) }
 }
 
-fn range_continues_after_start(end: &Address, ln: usize, is_last: bool) -> bool {
+/// 範囲終端の具体的な行番号（活性化時に確定できるもの）
+fn range_end_line_hint(end: &Address, start_line: usize) -> Option<usize> {
     match end {
-        Address::Line(n) => ln < *n,
-        Address::LastLine => !is_last,
-        Address::Regex(_) | Address::Step(_, _) => true,
+        Address::Line(n) => Some(*n),
+        Address::RelOffset(n) => Some(start_line + n),
+        Address::Multiple(n) => Some(((start_line + n - 1) / n) * n),
+        _ => None,
+    }
+}
+
+/// 活性化中の範囲がこの行で終わるか
+fn range_end_reached(end: &Address, active: &ActiveRange, ln: usize, is_last: bool, line: &str, opts: &Options) -> bool {
+    if let Some(el) = active.end_line {
+        return ln >= el;
+    }
+    match end {
+        Address::LastLine => is_last,
+        Address::Regex { .. } | Address::Step(_, _) => single_match(end, ln, is_last, line, opts),
+        _ => true,
     }
 }
 
@@ -1274,16 +1724,20 @@ fn single_match(a: &Address, ln: usize, is_last: bool, line: &str, opts: &Option
     match a {
         Address::Line(n) => ln == *n,
         Address::LastLine => is_last,
-        Address::Regex(p) => build_regex(p, false, false, opts)
-            .map(|r| r.is_match(line).unwrap_or(false))
-            .unwrap_or(false),
+        Address::Regex { pattern, ignore_case, multiline } => {
+            build_regex(pattern, *ignore_case, *multiline, opts)
+                .map(|r| r.is_match(line).unwrap_or(false))
+                .unwrap_or(false)
+        }
         Address::Step(f, s) => ln >= *f && *s > 0 && (ln - f) % s == 0,
+        Address::Zero => false,
+        Address::RelOffset(_) | Address::Multiple(_) => false,
     }
 }
 
 fn build_regex(pat: &str, ignore_case: bool, multiline: bool, opts: &Options) -> Result<Regex, FancyRegexError> {
     let base_pattern = if opts.extended_regex {
-        pat.to_string()
+        ere_fixup(pat)
     } else {
         bre_to_ere(pat)
     };
@@ -1296,6 +1750,31 @@ fn build_regex(pat: &str, ignore_case: bool, multiline: bool, opts: &Options) ->
     RegexBuilder::new(&pattern)
         .case_insensitive(ignore_case)
         .build()
+}
+
+/// ERE モードの前処理: GNU 拡張の \< \> を \b に変換する（ブラケット式の中は除く）
+fn ere_fixup(pattern: &str) -> String {
+    let mut out = String::new();
+    let mut chars = pattern.chars().peekable();
+    let mut in_bracket = false;
+
+    while let Some(c) = chars.next() {
+        if in_bracket {
+            out.push(c);
+            if c == ']' { in_bracket = false; }
+            continue;
+        }
+        match c {
+            '[' => { in_bracket = true; out.push(c); }
+            '\\' => match chars.next() {
+                Some('<') | Some('>') => out.push_str(r"\b"),
+                Some(n) => { out.push('\\'); out.push(n); }
+                None => out.push('\\'),
+            },
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn bre_to_ere(pattern: &str) -> String {
@@ -1339,6 +1818,8 @@ fn bre_to_ere(pattern: &str) -> String {
             if let Some(next) = chars.next() {
                 match next {
                     '(' | ')' | '{' | '}' => out.push(next),
+                    // GNU拡張: \< \> は単語境界
+                    '<' | '>' => out.push_str(r"\b"),
                     _ => {
                         out.push('\\');
                         out.push(next);
@@ -1362,74 +1843,159 @@ fn bre_to_ere(pattern: &str) -> String {
     out
 }
 
+/// 置換文字列のトークン
+#[derive(Debug, Clone, PartialEq)]
+enum ReplTok {
+    Lit(char),
+    Group(usize), // \1〜\9、& は Group(0)
+    UpperOne,     // \u: 次の1文字を大文字に
+    LowerOne,     // \l: 次の1文字を小文字に
+    UpperAll,     // \U: \E まで大文字に
+    LowerAll,     // \L: \E まで小文字に
+    CaseEnd,      // \E
+}
+
+fn parse_replacement(s: &str) -> Vec<ReplTok> {
+    let mut toks = Vec::new();
+    let mut cs = s.chars().peekable();
+    while let Some(c) = cs.next() {
+        if c == '\\' {
+            match cs.next() {
+                Some(n @ '0'..='9') => toks.push(ReplTok::Group(n.to_digit(10).unwrap() as usize)),
+                Some('&') => toks.push(ReplTok::Lit('&')),
+                Some('\\') => toks.push(ReplTok::Lit('\\')),
+                Some('n') => toks.push(ReplTok::Lit('\n')),
+                Some('t') => toks.push(ReplTok::Lit('\t')),
+                Some('r') => toks.push(ReplTok::Lit('\r')),
+                Some('u') => toks.push(ReplTok::UpperOne),
+                Some('l') => toks.push(ReplTok::LowerOne),
+                Some('U') => toks.push(ReplTok::UpperAll),
+                Some('L') => toks.push(ReplTok::LowerAll),
+                Some('E') => toks.push(ReplTok::CaseEnd),
+                Some(other) => toks.push(ReplTok::Lit(other)),
+                None => toks.push(ReplTok::Lit('\\')),
+            }
+        } else if c == '&' {
+            toks.push(ReplTok::Group(0));
+        } else {
+            toks.push(ReplTok::Lit(c));
+        }
+    }
+    toks
+}
+
+/// 大小変換の状態を保ちながらトークン列を展開する
+fn expand_replacement(toks: &[ReplTok], caps: &fancy_regex::Captures) -> String {
+    #[derive(Clone, Copy, PartialEq)]
+    enum CaseMode { None, Upper, Lower }
+
+    let mut out = String::new();
+    let mut mode = CaseMode::None;
+    let mut one_shot: Option<bool> = None; // Some(true)=大文字化, Some(false)=小文字化
+
+    let push_str = |out: &mut String, s: &str, mode: &CaseMode, one_shot: &mut Option<bool>| {
+        for ch in s.chars() {
+            let converted: String = if let Some(upper) = one_shot.take() {
+                if upper { ch.to_uppercase().collect() } else { ch.to_lowercase().collect() }
+            } else {
+                match mode {
+                    CaseMode::Upper => ch.to_uppercase().collect(),
+                    CaseMode::Lower => ch.to_lowercase().collect(),
+                    CaseMode::None => ch.to_string(),
+                }
+            };
+            out.push_str(&converted);
+        }
+    };
+
+    for tok in toks {
+        match tok {
+            ReplTok::Lit(c) => {
+                let s = c.to_string();
+                push_str(&mut out, &s, &mode, &mut one_shot);
+            }
+            ReplTok::Group(n) => {
+                let text = caps.get(*n).map(|m| m.as_str()).unwrap_or("");
+                push_str(&mut out, text, &mode, &mut one_shot);
+            }
+            ReplTok::UpperOne => one_shot = Some(true),
+            ReplTok::LowerOne => one_shot = Some(false),
+            ReplTok::UpperAll => { mode = CaseMode::Upper; one_shot = None; }
+            ReplTok::LowerAll => { mode = CaseMode::Lower; one_shot = None; }
+            ReplTok::CaseEnd => { mode = CaseMode::None; one_shot = None; }
+        }
+    }
+    out
+}
+
 fn apply_subst(line: &str, pat: &str, repl: &str, flags: &SubstituteFlags, opts: &Options) -> (String, bool) {
     let re = match build_regex(pat, flags.ignore_case, flags.multiline, opts) {
         Ok(r) => r,
         Err(_) => return (line.to_string(), false),
     };
-    
-    let repl = conv_backref(repl);
-    
-    if flags.global {
-        let r = re.replace_all(line, repl.as_str());
-        (r.to_string(), r != line)
-    } else if let Some(n) = flags.nth {
-        let mut cnt = 0; 
-        let mut last = 0; 
-        let mut res = String::new(); 
-        let mut ok = false;
-        for m in re.find_iter(line).flatten() {
-            cnt += 1;
-            if cnt == n {
-                res.push_str(&line[last..m.start()]);
-                let replaced = re.replace(m.as_str(), repl.as_str());
-                res.push_str(&replaced);
-                last = m.end(); 
-                ok = true; 
-                break;
-            }
-        }
-        res.push_str(&line[last..]);
-        if ok { (res, true) } else { (line.to_string(), false) }
-    } else {
-        let r = re.replace(line, repl.as_str());
-        (r.to_string(), r != line)
-    }
-}
 
-fn conv_backref(s: &str) -> String {
-    fn push_literal_replacement_char(out: &mut String, ch: char) {
-        if ch == '$' {
-            out.push_str("$$");
-        } else {
-            out.push(ch);
+    let toks = parse_replacement(repl);
+
+    // N 番目から置換を開始する。g との併用（GNU: N 番目以降すべて置換）にも対応
+    let start_n = flags.nth.unwrap_or(1);
+    let mut result = String::new();
+    let mut last = 0usize;
+    let mut count = 0usize;
+    let mut replaced = false;
+
+    for caps in re.captures_iter(line).flatten() {
+        let m = caps.get(0).unwrap();
+        count += 1;
+        let should = if flags.global { count >= start_n } else { count == start_n };
+        if should {
+            result.push_str(&line[last..m.start()]);
+            result.push_str(&expand_replacement(&toks, &caps));
+            last = m.end();
+            replaced = true;
+            if !flags.global { break; }
         }
     }
 
-    let mut r = String::new();
-    let mut cs = s.chars().peekable();
-    while let Some(c) = cs.next() {
-        if c == '\\' {
-            if let Some(&n) = cs.peek() {
-                match n {
-                    '0'..='9' => { r.push('$'); r.push(n); cs.next(); }
-                    '&' => { r.push('&'); cs.next(); }
-                    '\\' => { r.push('\\'); cs.next(); }
-                    'n' => { r.push('\n'); cs.next(); }
-                    't' => { r.push('\t'); cs.next(); }
-                    _ => { push_literal_replacement_char(&mut r, n); cs.next(); }
-                }
-            } else { r.push(c); }
-        } else if c == '&' { r.push_str("$0"); }
-        else { push_literal_replacement_char(&mut r, c); }
+    if !replaced {
+        return (line.to_string(), false);
     }
-    r
+    result.push_str(&line[last..]);
+    (result, true)
 }
 
 fn translate(s: &str, src: &[char], dst: &[char]) -> String {
     s.chars()
         .map(|c| src.iter().position(|&x| x == c).and_then(|p| dst.get(p).copied()).unwrap_or(c))
         .collect()
+}
+
+/// l コマンドの出力を組み立てる。`wrap` が 2 以上なら
+/// 各行が wrap 文字以内になるよう `\` + 改行で折り返す（GNU 互換、デフォルト 70）。
+/// wrap = 0 は折り返しなし。エスケープシーケンスの途中では折り返さない。
+fn format_unambiguous(s: &str, wrap: usize) -> String {
+    // 文字ごとにエスケープ済みトークンを作る
+    let tokens: Vec<String> = s.chars().map(|c| esc_unambig(&c.to_string())).collect();
+
+    if wrap < 2 {
+        let mut out: String = tokens.concat();
+        out.push('$');
+        return out;
+    }
+
+    let mut out = String::new();
+    let mut col = 0usize;
+    for tok in &tokens {
+        // 折り返し行は末尾の '\' を含めて wrap 文字以内
+        if col + tok.chars().count() > wrap - 1 {
+            out.push('\\');
+            out.push('\n');
+            col = 0;
+        }
+        out.push_str(tok);
+        col += tok.chars().count();
+    }
+    out.push('$');
+    out
 }
 
 fn esc_unambig(s: &str) -> String {
@@ -1452,9 +2018,26 @@ fn esc_unambig(s: &str) -> String {
     r
 }
 
-fn append_file(f: &str, line: &str, line_ending: &str) -> io::Result<()> {
-    let path = resolve_path_case_insensitive(f);
-    write!(OpenOptions::new().create(true).append(true).open(path)?, "{}{}", line, line_ending)
+/// w コマンド / s///w の書き込み。
+/// GNU 互換: 各出力ファイルは起動後最初の書き込みで truncate し、以後は追記する。
+/// /dev/stdout・/dev/stderr は特別扱いする。
+fn write_to_file(state: &mut SedState, f: &str, line: &str, line_ending: &str) -> io::Result<()> {
+    if !state.write_files.contains_key(f) {
+        let target = match f {
+            "/dev/stdout" => WriteTarget::Stdout,
+            "/dev/stderr" => WriteTarget::Stderr,
+            _ => {
+                let path = resolve_path_case_insensitive(f);
+                WriteTarget::File(OpenOptions::new().create(true).write(true).truncate(true).open(path)?)
+            }
+        };
+        state.write_files.insert(f.to_string(), target);
+    }
+    match state.write_files.get_mut(f).unwrap() {
+        WriteTarget::Stdout => write!(io::stdout(), "{}{}", line, line_ending),
+        WriteTarget::Stderr => write!(io::stderr(), "{}{}", line, line_ending),
+        WriteTarget::File(file) => write!(file, "{}{}", line, line_ending),
+    }
 }
 
 fn detect_encoding(bytes: &[u8]) -> &'static encoding_rs::Encoding {
@@ -1544,26 +2127,31 @@ mod tests {
         std::env::temp_dir().join(format!("sed-tests-{name}-{unique}"))
     }
 
-    fn run_script(script: &str, input: &[&str], opts: Options) -> String {
+    fn compile(script: &str) -> (Vec<super::SedCommand>, std::collections::HashMap<String, usize>) {
         let mut commands = parse_script(script).unwrap();
         assign_command_ids(&mut commands);
+        let commands = super::flatten_commands(commands);
         let labels = build_label_index(&commands);
+        (commands, labels)
+    }
+
+    fn run_script(script: &str, input: &[&str], opts: Options) -> String {
+        let (commands, labels) = compile(script);
         let mut out = Vec::new();
         process_lines(input, &commands, &labels, &opts, &mut out, "\n").unwrap();
         String::from_utf8(out).unwrap()
     }
 
     fn run_script_split(script: &str, chunks: &[Vec<&str>], opts: Options) -> String {
-        let mut commands = parse_script(script).unwrap();
-        assign_command_ids(&mut commands);
-        let labels = build_label_index(&commands);
+        let (commands, labels) = compile(script);
         let mut out = Vec::new();
         let mut state = SedState::new();
 
+        let file = std::rc::Rc::new("-".to_string());
         for chunk in chunks {
             let input_lines: Vec<InputLine> = chunk
                 .iter()
-                .map(|line| InputLine { text: (*line).to_string(), line_ending: "\n" })
+                .map(|line| InputLine { text: (*line).to_string(), line_ending: "\n", file: file.clone() })
                 .collect();
             process_input_lines(&input_lines, &commands, &labels, &opts, &mut out, &mut state).unwrap();
         }
@@ -1819,17 +2407,31 @@ mod tests {
     }
 
     #[test]
-    fn in_place_option_accepts_arbitrary_backup_suffix_as_next_argument() {
+    fn in_place_backup_suffix_must_be_attached_gnu_style() {
+        // GNU 互換: -i の直後の独立した引数はサフィックスではなくスクリプト
+        // （`sed -i 's/a/b/' file` が正しく動くことが最重要）
         let args = vec![
             "sed".to_string(),
             "-i".to_string(),
-            "backup".to_string(),
             "s/x/y/".to_string(),
             "file.txt".to_string(),
         ];
         let (opts, files) = parse_args(&args).unwrap();
         assert!(opts.in_place);
-        assert_eq!(opts.in_place_backup.as_deref(), Some("backup"));
+        assert_eq!(opts.in_place_backup, None);
+        assert_eq!(opts.expressions, vec!["s/x/y/"]);
+        assert_eq!(files, vec!["file.txt"]);
+
+        // 結合形式 -i.bak はサフィックス
+        let args = vec![
+            "sed".to_string(),
+            "-i.bak".to_string(),
+            "s/x/y/".to_string(),
+            "file.txt".to_string(),
+        ];
+        let (opts, files) = parse_args(&args).unwrap();
+        assert!(opts.in_place);
+        assert_eq!(opts.in_place_backup.as_deref(), Some(".bak"));
         assert_eq!(opts.expressions, vec!["s/x/y/"]);
         assert_eq!(files, vec!["file.txt"]);
     }
@@ -1951,6 +2553,171 @@ mod tests {
     #[test]
     fn unterminated_translate_command_is_rejected() {
         assert!(parse_script("y/ab").is_err());
+    }
+
+    #[test]
+    fn zero_regex_range_can_end_on_first_line() {
+        // 0,/re/ は 1 行目から終端判定する（1,/re/ との違い）
+        let quiet = Options { quiet: true, ..Options::default() };
+        let output = run_script("0,/foo/p", &["foo", "bar", "foo"], quiet);
+        assert_eq!(output, "foo\n");
+
+        let quiet = Options { quiet: true, ..Options::default() };
+        let output = run_script("1,/foo/p", &["foo", "bar", "foo"], quiet);
+        assert_eq!(output, "foo\nbar\nfoo\n");
+    }
+
+    #[test]
+    fn relative_offset_range_matches_n_following_lines() {
+        let output = run_script("2,+2d", &["a", "b", "c", "d", "e"], Options::default());
+        assert_eq!(output, "a\ne\n");
+    }
+
+    #[test]
+    fn multiple_range_ends_at_next_multiple() {
+        // 3,~4 → 3行目から次の4の倍数行（4行目）まで
+        let output = run_script("3,~4d", &["a", "b", "c", "d", "e"], Options::default());
+        assert_eq!(output, "a\nb\ne\n");
+    }
+
+    #[test]
+    fn address_regex_i_flag_ignores_case() {
+        let quiet = Options { quiet: true, ..Options::default() };
+        let output = run_script("/FOO/Ip", &["foo", "bar"], quiet);
+        assert_eq!(output, "foo\n");
+    }
+
+    #[test]
+    fn change_command_prints_text_once_for_a_range() {
+        let output = run_script("2,4c\\X", &["a", "b", "c", "d", "e"], Options::default());
+        assert_eq!(output, "a\nX\ne\n");
+    }
+
+    #[test]
+    fn change_command_prints_text_per_line_for_single_address() {
+        let output = run_script("/x/c\\Y", &["x", "a", "x"], Options::default());
+        assert_eq!(output, "Y\na\nY\n");
+    }
+
+    #[test]
+    fn substitution_case_conversion_escapes() {
+        let output = run_script(r"s/\(.*\)/\U\1/", &["abc"], Options::default());
+        assert_eq!(output, "ABC\n");
+        let output = run_script(r"s/\(.*\)/\u\1/", &["abc"], Options::default());
+        assert_eq!(output, "Abc\n");
+        let output = run_script(r"s/\(a\)\(bc\)/\U\1\E\2/", &["abc"], Options::default());
+        assert_eq!(output, "Abc\n");
+        let output = run_script(r"s/\(.*\)/\L\1/", &["ABC"], Options::default());
+        assert_eq!(output, "abc\n");
+    }
+
+    #[test]
+    fn substitution_nth_with_global_replaces_from_nth_onward() {
+        let output = run_script("s/o/0/2g", &["oooo"], Options::default());
+        assert_eq!(output, "o000\n");
+    }
+
+    #[test]
+    fn substitution_counts_as_made_even_when_output_is_identical() {
+        // s/a/a/ でも置換は「行われた」— t が分岐する
+        let quiet = Options { quiet: true, ..Options::default() };
+        let output = run_script("s/a/a/; t yes; b; :yes; p", &["a"], quiet);
+        assert_eq!(output, "a\n");
+    }
+
+    #[test]
+    fn word_boundary_escapes_are_supported() {
+        let output = run_script(r"s/\<cat\>/dog/", &["cat catalog"], Options::default());
+        assert_eq!(output, "dog catalog\n");
+    }
+
+    #[test]
+    fn branch_out_of_a_block_works() {
+        // ブロック内からブロック外のラベルへ分岐できる（フラット化の検証）
+        let quiet = Options { quiet: true, ..Options::default() };
+        let output = run_script("/a/{b skip}; p; :skip", &["a", "b"], quiet);
+        assert_eq!(output, "b\n");
+    }
+
+    #[test]
+    fn delete_first_line_restarts_whole_cycle_from_inside_a_block() {
+        // ブロック内の D もサイクル全体を再開する
+        let output = run_script("N; /b/{D}", &["a", "b"], Options::default());
+        assert_eq!(output, "b\n");
+    }
+
+    #[test]
+    fn undefined_branch_label_is_rejected_before_execution() {
+        let mut commands = parse_script("b nosuch").unwrap();
+        assign_command_ids(&mut commands);
+        let commands = super::flatten_commands(commands);
+        let labels = build_label_index(&commands);
+        assert!(super::validate_commands(&commands, &labels, &Options::default()).is_err());
+    }
+
+    #[test]
+    fn invalid_regex_is_rejected_before_execution() {
+        let mut commands = parse_script(r"s/a\(/X/").unwrap();
+        assign_command_ids(&mut commands);
+        let commands = super::flatten_commands(commands);
+        let labels = build_label_index(&commands);
+        assert!(super::validate_commands(&commands, &labels, &Options::default()).is_err());
+    }
+
+    #[test]
+    fn sandbox_rejects_file_and_exec_commands() {
+        let opts = Options { sandbox: true, ..Options::default() };
+        let mut commands = parse_script("w out.txt").unwrap();
+        assign_command_ids(&mut commands);
+        let commands = super::flatten_commands(commands);
+        let labels = build_label_index(&commands);
+        assert!(super::validate_commands(&commands, &labels, &opts).is_err());
+    }
+
+    #[test]
+    fn y_command_treats_hyphen_literally() {
+        // GNU 互換: y は範囲展開しない
+        let output = run_script("y/a-c/x-z/", &["a-c"], Options::default());
+        assert_eq!(output, "x-z\n");
+    }
+
+    #[test]
+    fn append_text_supports_multiline_continuation() {
+        let output = run_script("a\\line1\\\nline2", &["x"], Options::default());
+        assert_eq!(output, "x\nline1\nline2\n");
+    }
+
+    #[test]
+    fn l_command_wraps_long_lines_with_backslash() {
+        let quiet = Options { quiet: true, ..Options::default() };
+        let output = run_script("l 10", &["aaaaaaaaaaaaaaaaaaaa"], quiet);
+        // 各行は末尾の '\' を含めて 10 文字以内
+        for line in output.lines() {
+            assert!(line.chars().count() <= 10, "line too long: {line}");
+        }
+        assert!(output.ends_with("$\n"));
+        // 中身を復元すると元の文字数
+        let joined: String = output.lines().collect::<String>()
+            .replace('\\', "").replace('$', "");
+        assert_eq!(joined.chars().count(), 20);
+    }
+
+    #[test]
+    fn quit_code_is_propagated_not_exited() {
+        let (commands, labels) = compile("q5");
+        let mut out = Vec::new();
+        let code = process_lines(&["a", "b"], &commands, &labels, &Options::default(), &mut out, "\n").unwrap();
+        assert_eq!(code, Some(5));
+        assert_eq!(String::from_utf8(out).unwrap(), "a\n");
+    }
+
+    #[test]
+    fn quit_silent_code_suppresses_output() {
+        let (commands, labels) = compile("Q7");
+        let mut out = Vec::new();
+        let code = process_lines(&["a"], &commands, &labels, &Options::default(), &mut out, "\n").unwrap();
+        assert_eq!(code, Some(7));
+        assert!(out.is_empty());
     }
 
     #[test]

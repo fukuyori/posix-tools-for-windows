@@ -100,16 +100,32 @@ fn cli_expands_globs_internally() {
 }
 
 #[test]
-fn cli_in_place_edit_accepts_arbitrary_backup_suffix() {
+fn cli_in_place_edit_accepts_attached_backup_suffix() {
+    // GNU 互換: サフィックスは -iSUFFIX の結合形式のみ
     let root = test_dir("in-place");
     let input = root.join("sample.txt");
     write_file(&input, "before\n");
 
-    let output = run_sed(&["-i", "backup", "s/before/after/", &input.to_string_lossy()]);
+    let output = run_sed(&["-ibackup", "s/before/after/", &input.to_string_lossy()]);
 
     assert!(output.status.success());
     assert_eq!(fs::read_to_string(&input).unwrap(), "after\n");
     assert_eq!(fs::read_to_string(root.join("sample.txtbackup")).unwrap(), "before\n");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn cli_in_place_edit_does_not_consume_script_as_suffix() {
+    // GNU 互換: `sed -i 's/../../' file` が正しく動く（次引数をサフィックスにしない）
+    let root = test_dir("in-place-gnu");
+    let input = root.join("sample.txt");
+    write_file(&input, "before\n");
+
+    let output = run_sed(&["-i", "s/before/after/", &input.to_string_lossy()]);
+
+    assert!(output.status.success());
+    assert_eq!(fs::read_to_string(&input).unwrap(), "after\n");
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -238,13 +254,13 @@ fn multiple_e_args_compose_as_one_script() {
 #[test]
 fn parse_error_identifies_offending_e_argument() {
     // 2 つ目の -e で不正コマンド。エラーメッセージに `-e #2` と位置情報が含まれること。
-    let output = run_sed_stdin(&["-e", "/abc/d", "-e", "WOOPS"], "");
+    let output = run_sed_stdin(&["-e", "/abc/d", "-e", "XOOPS"], "");
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("-e #2"), "stderr was: {stderr}");
     assert!(stderr.contains("位置"), "stderr was: {stderr}");
-    assert!(stderr.contains("'W'"), "stderr was: {stderr}");
+    assert!(stderr.contains("'X'"), "stderr was: {stderr}");
 }
 
 #[cfg(target_os = "windows")]
