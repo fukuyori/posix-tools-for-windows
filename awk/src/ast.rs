@@ -53,6 +53,8 @@ impl fmt::Display for BinOp {
 #[derive(Debug, Clone, PartialEq)]
 pub enum UnaryOp {
     Neg,
+    /// Unary plus: coerces the operand to a number
+    Pos,
     Not,
     PreInc,
     PreDec,
@@ -109,9 +111,15 @@ pub enum Expr {
     },
     /// Function call
     Call { name: String, args: Vec<Expr> },
+    /// Parenthesized expression list: (e1, e2, ...)
+    /// Only valid directly under `print`/`printf` (as the argument list)
+    /// or before `in` (multidimensional membership test).
+    Grouping(Vec<Expr>),
+    /// Multidimensional membership test: (i, j, ...) in array
+    InArray { indices: Vec<Expr>, array: String },
     /// Getline variations
     Getline {
-        var: Option<String>,
+        var: Option<Box<Expr>>,
         file: Option<Box<Expr>>,
         command: Option<Box<Expr>>,
     },

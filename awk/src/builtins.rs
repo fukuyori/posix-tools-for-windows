@@ -1,6 +1,5 @@
 /// AWK Built-in Functions
 use crate::value::Value;
-use regex::Regex;
 use std::collections::HashMap;
 
 /// Result of a builtin function
@@ -19,7 +18,10 @@ pub struct BuiltinContext<'a> {
     pub rng_state: &'a mut u64,
 }
 
-/// Get the builtin function registry
+/// Get the builtin function registry.
+/// Note: `split`, `sub`, `gsub`, `match`, `close`, `fflush`, and `system`
+/// are handled directly by the interpreter because they need lvalue or
+/// I/O access; they are not in this table.
 pub fn get_builtins() -> HashMap<&'static str, BuiltinFn> {
     let mut builtins: HashMap<&'static str, BuiltinFn> = HashMap::new();
 
@@ -27,10 +29,6 @@ pub fn get_builtins() -> HashMap<&'static str, BuiltinFn> {
     builtins.insert("length", builtin_length);
     builtins.insert("substr", builtin_substr);
     builtins.insert("index", builtin_index);
-    builtins.insert("split", builtin_split);
-    builtins.insert("sub", builtin_sub);
-    builtins.insert("gsub", builtin_gsub);
-    builtins.insert("match", builtin_match);
     builtins.insert("sprintf", builtin_sprintf);
     builtins.insert("tolower", builtin_tolower);
     builtins.insert("toupper", builtin_toupper);
@@ -49,6 +47,36 @@ pub fn get_builtins() -> HashMap<&'static str, BuiltinFn> {
     builtins
 }
 
+/// Names that the parser should treat as callable builtins even when a
+/// space separates the name from `(`.
+pub fn is_builtin_name(name: &str) -> bool {
+    matches!(
+        name,
+        "length"
+            | "substr"
+            | "index"
+            | "split"
+            | "sub"
+            | "gsub"
+            | "match"
+            | "sprintf"
+            | "tolower"
+            | "toupper"
+            | "sin"
+            | "cos"
+            | "atan2"
+            | "exp"
+            | "log"
+            | "sqrt"
+            | "int"
+            | "rand"
+            | "srand"
+            | "close"
+            | "fflush"
+            | "system"
+    )
+}
+
 // String functions
 
 fn builtin_length(args: &[Value], ctx: &mut BuiltinContext) -> BuiltinResult {
@@ -57,33 +85,38 @@ fn builtin_length(args: &[Value], ctx: &mut BuiltinContext) -> BuiltinResult {
     } else {
         args[0].to_string()
     };
-    Ok(Value::Number(s.len() as f64))
+    Ok(Value::Number(s.chars().count() as f64))
 }
 
+/// substr(s, m[, n]) with POSIX clamping semantics:
+/// characters before position 1 count against n; out-of-range yields "".
 fn builtin_substr(args: &[Value], _ctx: &mut BuiltinContext) -> BuiltinResult {
-    if args.is_empty() {
+    if args.len() < 2 {
         return Err("substr requires at least 2 arguments".to_string());
     }
 
     let s = args[0].to_string();
     let chars: Vec<char> = s.chars().collect();
+    let len = chars.len() as i64;
 
-    // AWK uses 1-based indexing
-    let start = if args.len() > 1 {
-        (args[1].to_number() as i64 - 1).max(0) as usize
+    let m = args[1].to_number().trunc() as i64;
+    // Exclusive end position (1-based): m + n, or end of string
+    let end = if args.len() > 2 {
+        let n = args[2].to_number().trunc() as i64;
+        m.saturating_add(n)
     } else {
-        0
+        len + 1
     };
 
-    let len = if args.len() > 2 {
-        args[2].to_number() as usize
-    } else {
-        chars.len().saturating_sub(start)
-    };
+    let start = m.max(1);
+    let end = end.min(len + 1);
+    if start > len || end <= start {
+        return Ok(Value::String(String::new()));
+    }
 
-    let end = (start + len).min(chars.len());
-    let result: String = chars[start.min(chars.len())..end].iter().collect();
-
+    let result: String = chars[(start - 1) as usize..(end - 1) as usize]
+        .iter()
+        .collect();
     Ok(Value::String(result))
 }
 
@@ -95,139 +128,17 @@ fn builtin_index(args: &[Value], _ctx: &mut BuiltinContext) -> BuiltinResult {
     let haystack = args[0].to_string();
     let needle = args[1].to_string();
 
-    // AWK returns 1-based index, 0 if not found
-    let pos = haystack.find(&needle).map(|i| i + 1).unwrap_or(0);
+    if needle.is_empty() {
+        return Ok(Value::Number(0.0));
+    }
+
+    // AWK returns 1-based character index, 0 if not found
+    let pos = haystack
+        .find(&needle)
+        .map(|i| haystack[..i].chars().count() + 1)
+        .unwrap_or(0);
 
     Ok(Value::Number(pos as f64))
-}
-
-fn builtin_split(args: &[Value], ctx: &mut BuiltinContext) -> BuiltinResult {
-    if args.len() < 2 {
-        return Err("split requires at least 2 arguments".to_string());
-    }
-
-    let s = args[0].to_string();
-    let _array_name = args[1].to_string();
-
-    let sep = if args.len() > 2 {
-        args[2].to_string()
-    } else {
-        ctx.variables
-            .get("FS")
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| " ".to_string())
-    };
-
-    let parts: Vec<&str> = if sep == " " {
-        s.split_whitespace().collect()
-    } else if sep.is_empty() {
-        s.chars()
-            .map(|c| {
-                // This is a workaround - we need to return string slices
-                // For single char split, we'll handle differently
-                unsafe {
-                    std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                        &c as *const char as *const u8,
-                        1,
-                    ))
-                }
-            })
-            .collect()
-    } else {
-        s.split(&sep).collect()
-    };
-
-    // Note: Array assignment would be handled by the interpreter
-    // For now, return the count
-    Ok(Value::Number(parts.len() as f64))
-}
-
-fn builtin_sub(args: &[Value], ctx: &mut BuiltinContext) -> BuiltinResult {
-    if args.len() < 2 {
-        return Err("sub requires at least 2 arguments".to_string());
-    }
-
-    let pattern = args[0].to_string();
-    let replacement = args[1].to_string();
-
-    // Default target is $0
-    let target = if args.len() > 2 {
-        args[2].to_string()
-    } else {
-        ctx.record.to_string()
-    };
-
-    let re = Regex::new(&pattern).map_err(|e| e.to_string())?;
-
-    // Handle & in replacement (represents matched text)
-    let result = if let Some(m) = re.find(&target) {
-        let repl = replacement.replace('&', m.as_str());
-        let mut new_str = target.to_string();
-        new_str.replace_range(m.start()..m.end(), &repl);
-        new_str
-    } else {
-        target
-    };
-
-    // Return 1 if substitution made, 0 otherwise
-    let made_sub = result != ctx.record;
-
-    if args.len() <= 2 {
-        // Update $0 - this would be handled by interpreter
-    }
-
-    Ok(Value::Number(if made_sub { 1.0 } else { 0.0 }))
-}
-
-fn builtin_gsub(args: &[Value], ctx: &mut BuiltinContext) -> BuiltinResult {
-    if args.len() < 2 {
-        return Err("gsub requires at least 2 arguments".to_string());
-    }
-
-    let pattern = args[0].to_string();
-    let replacement = args[1].to_string();
-
-    let target = if args.len() > 2 {
-        args[2].to_string()
-    } else {
-        ctx.record.to_string()
-    };
-
-    let re = Regex::new(&pattern).map_err(|e| e.to_string())?;
-
-    let mut count = 0;
-    let _result = re.replace_all(&target, |caps: &regex::Captures| {
-        count += 1;
-        replacement.replace('&', &caps[0])
-    });
-
-    Ok(Value::Number(count as f64))
-}
-
-fn builtin_match(args: &[Value], ctx: &mut BuiltinContext) -> BuiltinResult {
-    if args.len() < 2 {
-        return Err("match requires 2 arguments".to_string());
-    }
-
-    let s = args[0].to_string();
-    let pattern = args[1].to_string();
-
-    let re = Regex::new(&pattern).map_err(|e| e.to_string())?;
-
-    if let Some(m) = re.find(&s) {
-        // Set RSTART and RLENGTH
-        ctx.variables
-            .insert("RSTART".to_string(), Value::Number((m.start() + 1) as f64));
-        ctx.variables
-            .insert("RLENGTH".to_string(), Value::Number(m.len() as f64));
-        Ok(Value::Number((m.start() + 1) as f64))
-    } else {
-        ctx.variables
-            .insert("RSTART".to_string(), Value::Number(0.0));
-        ctx.variables
-            .insert("RLENGTH".to_string(), Value::Number(-1.0));
-        Ok(Value::Number(0.0))
-    }
 }
 
 fn builtin_sprintf(args: &[Value], _ctx: &mut BuiltinContext) -> BuiltinResult {
@@ -330,177 +241,381 @@ fn builtin_srand(args: &[Value], ctx: &mut BuiltinContext) -> BuiltinResult {
     Ok(Value::Number(old_seed as f64))
 }
 
-/// Format string implementation (simplified printf)
+// ---------------------------------------------------------------------------
+// printf-style formatting
+// ---------------------------------------------------------------------------
+
+#[derive(Default, Clone, Copy)]
+struct FmtFlags {
+    minus: bool,
+    plus: bool,
+    space: bool,
+    alt: bool,
+    zero: bool,
+}
+
+/// Format string implementation (C printf subset per POSIX awk):
+/// flags `- + space # 0`, width (including `*`), precision (including `.*`),
+/// conversions `d i o u x X c s e E f F g G %`.
+/// Escape sequences are NOT processed here — string literals already had
+/// them expanded by the lexer, and dynamic strings must stay untouched.
 pub fn format_string(format: &str, args: &[Value]) -> String {
-    let mut result = String::new();
+    let mut out = String::new();
     let mut chars = format.chars().peekable();
-    let mut arg_idx = 0;
+    let mut arg_idx = 0usize;
+
+    fn take_arg(args: &[Value], idx: &mut usize) -> Value {
+        let v = args.get(*idx).cloned().unwrap_or(Value::Uninitialized);
+        *idx += 1;
+        v
+    }
 
     while let Some(c) = chars.next() {
-        if c == '%' {
-            if chars.peek() == Some(&'%') {
-                chars.next();
-                result.push('%');
-                continue;
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        if chars.peek() == Some(&'%') {
+            chars.next();
+            out.push('%');
+            continue;
+        }
+
+        // Flags
+        let mut flags = FmtFlags::default();
+        while let Some(&f) = chars.peek() {
+            match f {
+                '-' => flags.minus = true,
+                '+' => flags.plus = true,
+                ' ' => flags.space = true,
+                '#' => flags.alt = true,
+                '0' => flags.zero = true,
+                _ => break,
             }
+            chars.next();
+        }
 
-            // Parse format specifier
-            let mut width = String::new();
-            let mut precision = String::new();
-            let mut flags = String::new();
-            let mut in_precision = false;
-
-            // Flags
-            while let Some(&c) = chars.peek() {
-                if c == '-' || c == '+' || c == ' ' || c == '#' || c == '0' {
-                    flags.push(chars.next().unwrap());
-                } else {
-                    break;
-                }
+        // Width (digits or '*')
+        let mut width: Option<usize> = None;
+        if chars.peek() == Some(&'*') {
+            chars.next();
+            let w = take_arg(args, &mut arg_idx).to_number() as i64;
+            if w < 0 {
+                flags.minus = true;
+                width = Some(w.unsigned_abs() as usize);
+            } else {
+                width = Some(w as usize);
             }
-
-            // Width
-            while let Some(&c) = chars.peek() {
-                if c.is_ascii_digit() {
-                    width.push(chars.next().unwrap());
-                } else if c == '.' {
+        } else {
+            let mut w = String::new();
+            while let Some(&d) = chars.peek() {
+                if d.is_ascii_digit() {
+                    w.push(d);
                     chars.next();
-                    in_precision = true;
-                    break;
                 } else {
                     break;
                 }
             }
+            if !w.is_empty() {
+                width = w.parse().ok();
+            }
+        }
 
-            // Precision
-            if in_precision {
-                while let Some(&c) = chars.peek() {
-                    if c.is_ascii_digit() {
-                        precision.push(chars.next().unwrap());
+        // Precision ('.' then digits or '*')
+        let mut precision: Option<usize> = None;
+        if chars.peek() == Some(&'.') {
+            chars.next();
+            if chars.peek() == Some(&'*') {
+                chars.next();
+                let p = take_arg(args, &mut arg_idx).to_number() as i64;
+                if p >= 0 {
+                    precision = Some(p as usize);
+                }
+            } else {
+                let mut p = String::new();
+                while let Some(&d) = chars.peek() {
+                    if d.is_ascii_digit() {
+                        p.push(d);
+                        chars.next();
                     } else {
                         break;
                     }
                 }
+                precision = Some(p.parse().unwrap_or(0));
             }
-
-            // Conversion specifier
-            if let Some(spec) = chars.next() {
-                let val = if arg_idx < args.len() {
-                    &args[arg_idx]
-                } else {
-                    &Value::Uninitialized
-                };
-                arg_idx += 1;
-
-                let width: usize = width.parse().unwrap_or(0);
-                let prec: usize = precision.parse().unwrap_or(6);
-                let left_align = flags.contains('-');
-
-                let formatted = match spec {
-                    'd' | 'i' => {
-                        let n = val.to_number() as i64;
-                        format!("{}", n)
-                    }
-                    'o' => {
-                        let n = val.to_number() as i64;
-                        format!("{:o}", n)
-                    }
-                    'x' => {
-                        let n = val.to_number() as i64;
-                        format!("{:x}", n)
-                    }
-                    'X' => {
-                        let n = val.to_number() as i64;
-                        format!("{:X}", n)
-                    }
-                    'u' => {
-                        let n = val.to_number() as u64;
-                        format!("{}", n)
-                    }
-                    'c' => {
-                        let s = val.to_string();
-                        s.chars().next().map(|c| c.to_string()).unwrap_or_default()
-                    }
-                    's' => {
-                        let s = val.to_string();
-                        if !precision.is_empty() {
-                            s.chars().take(prec).collect()
-                        } else {
-                            s
-                        }
-                    }
-                    'e' => {
-                        let n = val.to_number();
-                        format!("{:.prec$e}", n, prec = prec)
-                    }
-                    'E' => {
-                        let n = val.to_number();
-                        format!("{:.prec$E}", n, prec = prec)
-                    }
-                    'f' => {
-                        let n = val.to_number();
-                        format!("{:.prec$}", n, prec = prec)
-                    }
-                    'g' => {
-                        let n = val.to_number();
-                        // Simplified g format
-                        if n.abs() < 0.0001 || n.abs() >= 1e6 {
-                            format!("{:.prec$e}", n, prec = prec)
-                        } else {
-                            format!("{:.prec$}", n, prec = prec)
-                        }
-                    }
-                    'G' => {
-                        let n = val.to_number();
-                        if n.abs() < 0.0001 || n.abs() >= 1e6 {
-                            format!("{:.prec$E}", n, prec = prec)
-                        } else {
-                            format!("{:.prec$}", n, prec = prec)
-                        }
-                    }
-                    _ => format!("%{}", spec),
-                };
-
-                // Apply width
-                if width > formatted.len() {
-                    let padding = width - formatted.len();
-                    if left_align {
-                        result.push_str(&formatted);
-                        result.push_str(&" ".repeat(padding));
-                    } else {
-                        let pad_char = if flags.contains('0') && !left_align {
-                            '0'
-                        } else {
-                            ' '
-                        };
-                        result.push_str(&pad_char.to_string().repeat(padding));
-                        result.push_str(&formatted);
-                    }
-                } else {
-                    result.push_str(&formatted);
-                }
-            }
-        } else if c == '\\' {
-            // Handle escape sequences
-            if let Some(next) = chars.next() {
-                match next {
-                    'n' => result.push('\n'),
-                    't' => result.push('\t'),
-                    'r' => result.push('\r'),
-                    '\\' => result.push('\\'),
-                    '"' => result.push('"'),
-                    _ => {
-                        result.push('\\');
-                        result.push(next);
-                    }
-                }
-            }
-        } else {
-            result.push(c);
         }
+
+        // Conversion specifier
+        let Some(spec) = chars.next() else {
+            out.push('%');
+            break;
+        };
+
+        let body = match spec {
+            'd' | 'i' => {
+                let val = take_arg(args, &mut arg_idx);
+                format_signed_int(val.to_number(), precision, flags)
+            }
+            'o' | 'u' | 'x' | 'X' => {
+                let val = take_arg(args, &mut arg_idx);
+                format_unsigned_int(val.to_number(), spec, precision, flags)
+            }
+            'c' => {
+                let val = take_arg(args, &mut arg_idx);
+                format_char(&val)
+            }
+            's' => {
+                let val = take_arg(args, &mut arg_idx);
+                let s = val.to_string();
+                if let Some(p) = precision {
+                    s.chars().take(p).collect()
+                } else {
+                    s
+                }
+            }
+            'e' | 'E' => {
+                let val = take_arg(args, &mut arg_idx);
+                format_float_sign(val.to_number(), flags, |n| {
+                    format_float_exp(n, precision.unwrap_or(6), spec == 'E', flags.alt)
+                })
+            }
+            'f' | 'F' => {
+                let val = take_arg(args, &mut arg_idx);
+                format_float_sign(val.to_number(), flags, |n| {
+                    format_float_fixed(n, precision.unwrap_or(6), flags.alt)
+                })
+            }
+            'g' | 'G' => {
+                let val = take_arg(args, &mut arg_idx);
+                format_float_sign(val.to_number(), flags, |n| {
+                    format_float_general(n, precision.unwrap_or(6), spec == 'G', flags.alt)
+                })
+            }
+            other => {
+                // Unknown conversion: emit it literally
+                out.push('%');
+                out.push(other);
+                continue;
+            }
+        };
+
+        out.push_str(&pad_field(&body, width, spec, precision, flags));
     }
 
-    result
+    out
+}
+
+fn format_char(val: &Value) -> String {
+    match val {
+        Value::Number(n) | Value::NumericString(_, n) => {
+            let code = *n as i64;
+            if code <= 0 {
+                String::new()
+            } else {
+                char::from_u32(code as u32)
+                    .map(|c| c.to_string())
+                    .unwrap_or_default()
+            }
+        }
+        _ => val
+            .to_string()
+            .chars()
+            .next()
+            .map(|c| c.to_string())
+            .unwrap_or_default(),
+    }
+}
+
+fn format_signed_int(n: f64, precision: Option<usize>, flags: FmtFlags) -> String {
+    let i = if n.is_nan() {
+        0
+    } else {
+        n.trunc().clamp(i64::MIN as f64, i64::MAX as f64) as i64
+    };
+    let mut digits = format!("{}", i.unsigned_abs());
+    if let Some(p) = precision {
+        if p == 0 && i == 0 {
+            digits.clear();
+        } else if digits.len() < p {
+            digits = format!("{}{}", "0".repeat(p - digits.len()), digits);
+        }
+    }
+    let sign = if i < 0 {
+        "-"
+    } else if flags.plus {
+        "+"
+    } else if flags.space {
+        " "
+    } else {
+        ""
+    };
+    format!("{}{}", sign, digits)
+}
+
+fn format_unsigned_int(n: f64, spec: char, precision: Option<usize>, flags: FmtFlags) -> String {
+    // Negative values wrap like a 64-bit two's-complement unsigned int
+    let u = if n.is_nan() {
+        0u64
+    } else if n < 0.0 {
+        n.trunc().clamp(i64::MIN as f64, i64::MAX as f64) as i64 as u64
+    } else {
+        n.trunc().min(u64::MAX as f64) as u64
+    };
+    let mut digits = match spec {
+        'o' => format!("{:o}", u),
+        'x' => format!("{:x}", u),
+        'X' => format!("{:X}", u),
+        _ => format!("{}", u),
+    };
+    if let Some(p) = precision {
+        if p == 0 && u == 0 {
+            digits.clear();
+        } else if digits.len() < p {
+            digits = format!("{}{}", "0".repeat(p - digits.len()), digits);
+        }
+    }
+    if flags.alt && u != 0 {
+        match spec {
+            'o' if !digits.starts_with('0') => digits = format!("0{}", digits),
+            'x' => digits = format!("0x{}", digits),
+            'X' => digits = format!("0X{}", digits),
+            _ => {}
+        }
+    }
+    digits
+}
+
+/// Apply sign handling for float conversions: format |n| via `f`,
+/// then prepend '-', '+', or ' ' as appropriate.
+fn format_float_sign<F: Fn(f64) -> String>(n: f64, flags: FmtFlags, f: F) -> String {
+    let neg = n < 0.0 || (n == 0.0 && n.is_sign_negative());
+    let body = if n.is_nan() {
+        "nan".to_string()
+    } else if n.is_infinite() {
+        "inf".to_string()
+    } else {
+        f(n.abs())
+    };
+    let sign = if neg {
+        "-"
+    } else if flags.plus {
+        "+"
+    } else if flags.space {
+        " "
+    } else {
+        ""
+    };
+    format!("{}{}", sign, body)
+}
+
+/// %f for a non-negative finite value
+fn format_float_fixed(n: f64, precision: usize, alt: bool) -> String {
+    let mut s = format!("{:.prec$}", n, prec = precision);
+    if precision == 0 && alt {
+        s.push('.');
+    }
+    s
+}
+
+/// %e / %E for a non-negative finite value: C-style exponent (e+NN)
+fn format_float_exp(n: f64, precision: usize, upper: bool, alt: bool) -> String {
+    let raw = format!("{:.prec$e}", n, prec = precision);
+    let (mut mantissa, exp) = split_exponent(&raw);
+    if precision == 0 && alt && !mantissa.contains('.') {
+        mantissa.push('.');
+    }
+    let e = if upper { 'E' } else { 'e' };
+    let sign = if exp < 0 { '-' } else { '+' };
+    format!("{}{}{}{:02}", mantissa, e, sign, exp.abs())
+}
+
+/// %g / %G for a non-negative finite value. `precision` is the number of
+/// significant digits. Also used for OFMT/CONVFMT-style conversion.
+pub fn format_float_general(n: f64, precision: usize, upper: bool, alt: bool) -> String {
+    let p = precision.max(1);
+    if n == 0.0 {
+        return "0".to_string();
+    }
+
+    // Determine the decimal exponent after rounding to p significant digits
+    let rounded = format!("{:.prec$e}", n, prec = p - 1);
+    let (mantissa, exp) = split_exponent(&rounded);
+
+    if exp < -4 || exp >= p as i32 {
+        // Exponential form
+        let mantissa = if alt {
+            mantissa
+        } else {
+            trim_trailing_zeros(&mantissa)
+        };
+        let e = if upper { 'E' } else { 'e' };
+        let sign = if exp < 0 { '-' } else { '+' };
+        format!("{}{}{}{:02}", mantissa, e, sign, exp.abs())
+    } else {
+        // Fixed form with p significant digits
+        let decimals = (p as i32 - 1 - exp).max(0) as usize;
+        let s = format!("{:.prec$}", n, prec = decimals);
+        if alt {
+            s
+        } else {
+            trim_trailing_zeros(&s)
+        }
+    }
+}
+
+/// Split Rust's `{:e}` output ("1.234e5") into (mantissa, exponent)
+fn split_exponent(s: &str) -> (String, i32) {
+    match s.find(['e', 'E']) {
+        Some(pos) => {
+            let exp = s[pos + 1..].parse::<i32>().unwrap_or(0);
+            (s[..pos].to_string(), exp)
+        }
+        None => (s.to_string(), 0),
+    }
+}
+
+fn trim_trailing_zeros(s: &str) -> String {
+    if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Pad a formatted field to `width`.
+fn pad_field(
+    body: &str,
+    width: Option<usize>,
+    spec: char,
+    precision: Option<usize>,
+    flags: FmtFlags,
+) -> String {
+    let Some(w) = width else {
+        return body.to_string();
+    };
+    let len = body.chars().count();
+    if len >= w {
+        return body.to_string();
+    }
+    let pad = w - len;
+
+    if flags.minus {
+        return format!("{}{}", body, " ".repeat(pad));
+    }
+
+    // '0' flag: pad with zeros after the sign for numeric conversions,
+    // but not for integers with an explicit precision, and not for %c/%s.
+    let int_spec = matches!(spec, 'd' | 'i' | 'o' | 'u' | 'x' | 'X');
+    let numeric = int_spec || matches!(spec, 'e' | 'E' | 'f' | 'F' | 'g' | 'G');
+    if flags.zero && numeric && !(int_spec && precision.is_some()) && !body.ends_with("inf") && !body.ends_with("nan") {
+        let (sign, rest) = match body.chars().next() {
+            Some(c @ ('-' | '+' | ' ')) => (c.to_string(), &body[c.len_utf8()..]),
+            _ => (String::new(), body),
+        };
+        return format!("{}{}{}", sign, "0".repeat(pad), rest);
+    }
+
+    format!("{}{}", " ".repeat(pad), body)
 }
 
 #[cfg(test)]
@@ -523,5 +638,63 @@ mod tests {
 
         let result = format_string("[%-10s]", &[Value::String("hi".to_string())]);
         assert_eq!(result, "[hi        ]");
+    }
+
+    #[test]
+    fn test_printf_flags() {
+        assert_eq!(format_string("%+d", &[Value::Number(42.0)]), "+42");
+        assert_eq!(format_string("% d", &[Value::Number(42.0)]), " 42");
+        assert_eq!(format_string("%05d", &[Value::Number(42.0)]), "00042");
+        assert_eq!(format_string("%05d", &[Value::Number(-42.0)]), "-0042");
+        assert_eq!(format_string("%#o", &[Value::Number(8.0)]), "010");
+        assert_eq!(format_string("%#x", &[Value::Number(255.0)]), "0xff");
+    }
+
+    #[test]
+    fn test_printf_dynamic_width_precision() {
+        assert_eq!(
+            format_string("[%*d]", &[Value::Number(5.0), Value::Number(42.0)]),
+            "[   42]"
+        );
+        assert_eq!(
+            format_string(
+                "[%*.*f]",
+                &[Value::Number(8.0), Value::Number(2.0), Value::Number(3.14159)]
+            ),
+            "[    3.14]"
+        );
+    }
+
+    #[test]
+    fn test_printf_char() {
+        assert_eq!(format_string("%c", &[Value::Number(65.0)]), "A");
+        assert_eq!(
+            format_string("%c", &[Value::String("hello".to_string())]),
+            "h"
+        );
+        assert_eq!(
+            format_string("%c", &[Value::NumericString("65".to_string(), 65.0)]),
+            "A"
+        );
+    }
+
+    #[test]
+    fn test_printf_exponent_format() {
+        assert_eq!(
+            format_string("%e", &[Value::Number(12345.6789)]),
+            "1.234568e+04"
+        );
+        assert_eq!(format_string("%E", &[Value::Number(0.5)]), "5.000000E-01");
+    }
+
+    #[test]
+    fn test_printf_general_format() {
+        assert_eq!(format_string("%g", &[Value::Number(0.00001)]), "1e-05");
+        assert_eq!(
+            format_string("%g", &[Value::Number(123456789.0)]),
+            "1.23457e+08"
+        );
+        assert_eq!(format_string("%g", &[Value::Number(100.0)]), "100");
+        assert_eq!(format_string("%.3g", &[Value::Number(3.14159)]), "3.14");
     }
 }

@@ -5,8 +5,10 @@ Windows の使い勝手は維持しつつ、AWK 言語仕様はできるだけ P
 
 ## 特徴
 
-- `getline`, `split`, `sub`, `gsub`, `match`, `nextfile`, `fflush`, `system` を実装
-- `ARGC`, `ARGV`, `ENVIRON`, `RSTART`, `RLENGTH`, `OFMT` を実装
+- `getline` 全形式（`getline`, `getline var`, `getline [var] < file`, `cmd | getline [var]`、NR/FNR の更新規則も POSIX 準拠）
+- `split`, `sub`, `gsub`, `match`, `nextfile`, `fflush`, `system` を実装
+- `ARGC`, `ARGV`, `ENVIRON`, `RSTART`, `RLENGTH`, `OFMT`, `CONVFMT`, `SUBSEP` を実装
+- コマンドライン `var=value` 代入オペランド（ファイル列の途中で有効化）
 - `BEGIN` で変更した `ARGV` を実際の入力ファイル列に反映
 - Windows では CLI 引数の glob 展開を awk 側で補完
 - ファイル名比較は Windows 向けに case-insensitive
@@ -15,16 +17,19 @@ Windows の使い勝手は維持しつつ、AWK 言語仕様はできるだけ P
 ## 実装済み機能
 
 - パターン: `BEGIN`, `END`, 正規表現パターン, 式パターン, 範囲パターン
-- アクション: `print`, `printf`, `if`, `while`, `do/while`, `for`, `for (k in a)`, `break`, `continue`, `next`, `nextfile`, `exit`, `return`, `delete`
-- 演算子: 算術, 比較, 論理, 正規表現マッチ, 三項演算子, 代入, インクリメント/デクリメント
-- データモデル: フィールドアクセス, 連想配列, ユーザー定義関数, 文字列連結
+- アクション: `print`, `printf`, `if/else`, `while`, `do/while`, `for`, `for (k in a)`, `break`, `continue`, `next`, `nextfile`, `exit`, `return`, `delete a[i]`, `delete a`（配列全体）
+- 演算子: 算術（`^`/`**`, 単項 `+`/`-` の POSIX 優先順位）, 比較（数値文字列規則）, 論理, 正規表現マッチ, 三項演算子, 代入, インクリメント/デクリメント, `(i, j) in a`
+- データモデル: フィールドアクセス, 連想配列（スカラーは値渡し・**配列は参照渡し**）, ユーザー定義関数（`function`/`func`, ローカル変数としての余剰仮引数, 再帰）, 文字列連結
 - 入出力: `>`, `>>`, `|`, `getline`, `close`, `fflush`, `system`
+- レコード分割: 1文字 `RS`, `RS=""`（段落モード, 改行は常にフィールド区切り）, 複数文字 `RS` は ERE として解釈（gawk 拡張）
+- printf: `diouxXcseEfgG%`, フラグ `- + space # 0`, 幅・精度（`*` による動的指定も対応）, `%c` は数値を文字コードとして解釈
+- `exit` 後も `END` を一度だけ実行（POSIX セマンティクス）, ゼロ除算は実行時エラー
 
 ## 主な組み込み関数
 
-- 文字列: `length`, `substr`, `index`, `split`, `sub`, `gsub`, `match`, `sprintf`, `tolower`, `toupper`
+- 文字列: `length`（引数なし・文字列・配列）, `substr`, `index`, `split`, `sub`, `gsub`, `match`, `sprintf`, `tolower`, `toupper`
 - 数学: `sin`, `cos`, `atan2`, `exp`, `log`, `sqrt`, `int`, `rand`, `srand`
-- その他: `system`
+- その他: `system`, `close`, `fflush`
 
 ## 使い方
 
@@ -37,7 +42,12 @@ awk 'プログラム' [ファイル...]
 awk -f プログラムファイル [ファイル...]
 awk -F 区切り文字 'プログラム' [ファイル...]
 awk -v 変数=値 'プログラム' [ファイル...]
+awk 'プログラム' file1 var=value file2   # 代入オペランド
+awk -- '-x で始まるプログラム'            # -- でオプション終了
 ```
+
+`-v` / `-F` / 代入オペランドの値は文字列リテラルと同じエスケープ処理
+（`\t`, `\n`, `\101` など）が行われます。
 
 Windows では `*.txt` のようなファイル引数を `awk` 側で glob 展開します。  
 マッチしない場合は POSIX シェル寄りにリテラルのまま扱います。
@@ -128,6 +138,7 @@ awk-rs/
 - `[[.ch.]]` のような collating symbol は未対応
 - `[[=a=]]` のような equivalence class は未対応
 - regex エンジンはかなり POSIX ERE に寄せているが、厳密な全互換を保証するものではない
+- `BEGIN` 内での引数なし `getline`（メイン入力の先読み）は未対応
 
 ## テスト
 

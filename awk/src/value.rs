@@ -54,19 +54,22 @@ impl Value {
             Value::Uninitialized => false,
             Value::Number(n) => *n != 0.0,
             Value::String(s) => !s.is_empty(),
-            Value::NumericString(s, n) => *n != 0.0 || !s.is_empty(),
+            // A numeric string is treated as a number: "0" is false
+            Value::NumericString(_, n) => *n != 0.0,
         }
     }
 
     /// Check if value is numeric
+    #[allow(dead_code)]
     pub fn is_numeric(&self) -> bool {
         matches!(self, Value::Number(_) | Value::NumericString(_, _))
     }
 
-    /// Create from string, detecting numeric strings
+    /// Create from string, detecting numeric strings.
+    /// Per POSIX a numeric string must consist entirely of a number
+    /// (with optional surrounding whitespace); "12abc" is NOT numeric.
     pub fn from_string(s: String) -> Self {
-        let trimmed = s.trim();
-        if let Some(n) = try_parse_number(trimmed) {
+        if let Some(n) = parse_full_number(s.trim()) {
             Value::NumericString(s, n)
         } else {
             Value::String(s)
@@ -98,19 +101,20 @@ impl From<&str> for Value {
     }
 }
 
-/// Parse a string as a number (AWK style)
+/// Parse a string as a number (AWK style: numeric prefix, 0 if none)
 fn parse_number(s: &str) -> f64 {
-    try_parse_number(s).unwrap_or(0.0)
+    let (n, _) = parse_number_prefix(s);
+    n
 }
 
-/// Try to parse a string as a number
-fn try_parse_number(s: &str) -> Option<f64> {
+/// Parse the numeric prefix of a string.
+/// Returns (value, chars consumed of the trimmed string).
+fn parse_number_prefix(s: &str) -> (f64, usize) {
     let s = s.trim();
     if s.is_empty() {
-        return Some(0.0);
+        return (0.0, 0);
     }
 
-    // Find the numeric prefix
     let mut end = 0;
     let chars: Vec<char> = s.chars().collect();
 
@@ -137,7 +141,7 @@ fn try_parse_number(s: &str) -> Option<f64> {
     }
 
     // Exponent
-    if end < chars.len() && (chars[end] == 'e' || chars[end] == 'E') {
+    if has_digits && end < chars.len() && (chars[end] == 'e' || chars[end] == 'E') {
         let exp_start = end;
         end += 1;
         if end < chars.len() && (chars[end] == '+' || chars[end] == '-') {
@@ -154,104 +158,71 @@ fn try_parse_number(s: &str) -> Option<f64> {
     }
 
     if !has_digits {
-        return None;
+        return (0.0, 0);
     }
 
     let num_str: String = chars[..end].iter().collect();
-    num_str.parse().ok()
+    (num_str.parse().unwrap_or(0.0), end)
 }
 
-/// Format a number for output
+/// Parse a string that must be entirely a number (no trailing junk).
+/// Used for numeric-string detection. Empty strings are not numeric.
+fn parse_full_number(s: &str) -> Option<f64> {
+    if s.is_empty() {
+        return None;
+    }
+    let (n, consumed) = parse_number_prefix(s);
+    if consumed == s.chars().count() {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+/// Format a number for output.
+/// Integral values are printed as integers (POSIX: "%d" conversion);
+/// other values use %.6g (the default CONVFMT/OFMT).
 pub fn format_number(n: f64) -> String {
-    if n.fract() == 0.0 && n.abs() < 1e15 {
+    if n.is_nan() {
+        return "nan".to_string();
+    }
+    if n.is_infinite() {
+        return if n < 0.0 { "-inf" } else { "inf" }.to_string();
+    }
+    if n.fract() == 0.0 && n.abs() < 9.2e18 {
         format!("{}", n as i64)
     } else {
-        // Use %.6g style formatting
-        let formatted = format!("{:.6}", n);
-        // Remove trailing zeros after decimal point
-        let formatted = formatted.trim_end_matches('0');
-        let formatted = formatted.trim_end_matches('.');
-        formatted.to_string()
+        crate::builtins::format_float_general(n, 6, false, false)
     }
 }
 
-/// Format a number with a specific format
-fn format_number_with_fmt(n: f64, fmt: &str) -> String {
-    if fmt == "%.6g" {
+/// Format a number with a specific format (OFMT/CONVFMT).
+/// Per POSIX, integral values always use "%d"-style conversion.
+pub fn format_number_with_fmt(n: f64, fmt: &str) -> String {
+    if n.fract() == 0.0 || !n.is_finite() {
         return format_number(n);
     }
+    crate::builtins::format_string(fmt, &[Value::Number(n)])
+}
 
-    let Some(stripped) = fmt.strip_prefix('%') else {
-        return format_number(n);
+/// Compare two values per POSIX comparison rules.
+/// Uninitialized values act as both 0 and "" — they compare numerically
+/// against numbers/numeric strings and as "" against plain strings.
+/// Returns None when the comparison is unordered (NaN involved).
+pub fn compare_values(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
+    let numeric = |v: &Value| {
+        matches!(
+            v,
+            Value::Number(_) | Value::NumericString(_, _) | Value::Uninitialized
+        )
     };
-    let Some(spec) = stripped.chars().last() else {
-        return format_number(n);
-    };
-
-    let body = &stripped[..stripped.len().saturating_sub(spec.len_utf8())];
-    let precision = body
-        .strip_prefix('.')
-        .and_then(|p| p.parse::<usize>().ok())
-        .unwrap_or(6);
-
-    match spec {
-        'f' | 'F' => format!("{:.precision$}", n, precision = precision),
-        'e' => format!("{:.precision$e}", n, precision = precision),
-        'E' => format!("{:.precision$E}", n, precision = precision),
-        'g' => format_general(n, precision, false),
-        'G' => format_general(n, precision, true),
-        _ => format_number(n),
-    }
-}
-
-fn format_general(n: f64, precision: usize, upper: bool) -> String {
-    let precision = precision.max(1);
-    let abs = n.abs();
-    let use_exp = (abs != 0.0 && abs < 0.0001) || abs >= 10f64.powi(precision as i32);
-
-    let raw = if use_exp {
-        if upper {
-            format!("{:.prec$E}", n, prec = precision.saturating_sub(1))
-        } else {
-            format!("{:.prec$e}", n, prec = precision.saturating_sub(1))
-        }
-    } else {
-        format!("{:.prec$}", n, prec = precision.saturating_sub(1))
-    };
-
-    trim_float_string(&raw)
-}
-
-fn trim_float_string(s: &str) -> String {
-    if let Some(exp_pos) = s.find(['e', 'E']) {
-        let (mantissa, exponent) = s.split_at(exp_pos);
-        format!("{}{}", trim_decimal_part(mantissa), exponent)
-    } else {
-        trim_decimal_part(s)
-    }
-}
-
-fn trim_decimal_part(s: &str) -> String {
-    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-    if trimmed.is_empty() || trimmed == "-" {
-        "0".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-/// Compare two values
-pub fn compare_values(left: &Value, right: &Value) -> std::cmp::Ordering {
-    // If both are numeric, compare as numbers
-    if left.is_numeric() && right.is_numeric() {
-        let l = left.to_number();
-        let r = right.to_number();
-        l.partial_cmp(&r).unwrap_or(std::cmp::Ordering::Equal)
+    if numeric(left) && numeric(right) {
+        left.to_number().partial_cmp(&right.to_number())
     } else {
         // Otherwise compare as strings
         let l = left.to_string();
         let r = right.to_string();
-        l.cmp(&r)
+        Some(l.cmp(&r))
     }
 }
 
@@ -361,6 +332,32 @@ mod tests {
     fn test_format_number_with_ofmt() {
         assert_eq!(format_number_with_fmt(3.5, "%.2f"), "3.50");
         assert_eq!(format_number_with_fmt(12.0, "%.3g"), "12");
-        assert_eq!(format_number_with_fmt(0.00123, "%.2e"), "1.23e-3");
+        assert_eq!(format_number_with_fmt(0.00123, "%.2e"), "1.23e-03");
+    }
+
+    #[test]
+    fn test_numeric_string_requires_full_number() {
+        assert!(!Value::from_string("12abc".to_string()).is_numeric());
+        assert!(!Value::from_string("".to_string()).is_numeric());
+        assert!(Value::from_string(" 1e3 ".to_string()).is_numeric());
+    }
+
+    #[test]
+    fn test_uninitialized_compares_as_zero_and_empty() {
+        let u = Value::Uninitialized;
+        assert_eq!(
+            compare_values(&u, &Value::Number(0.0)),
+            Some(std::cmp::Ordering::Equal)
+        );
+        assert_eq!(
+            compare_values(&u, &Value::String(String::new())),
+            Some(std::cmp::Ordering::Equal)
+        );
+    }
+
+    #[test]
+    fn test_nan_comparison_is_unordered() {
+        let nan = Value::Number(f64::NAN);
+        assert_eq!(compare_values(&nan, &nan), None);
     }
 }

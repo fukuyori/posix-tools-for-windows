@@ -110,7 +110,7 @@ impl<'a> Parser<'a> {
         self.expect(Token::Function)?;
 
         let name = match &self.current {
-            Token::Identifier(n) => n.clone(),
+            Token::Identifier(n) | Token::FuncName(n) => n.clone(),
             _ => return Err(self.error("Expected function name")),
         };
         self.advance()?;
@@ -261,7 +261,9 @@ impl<'a> Parser<'a> {
         self.skip_newlines()?;
 
         let then_branch = Box::new(self.parse_stmt()?);
-        self.skip_newlines()?;
+        // Allow statement terminators before `else`:
+        //   if (c) print "a"; else print "b"
+        self.skip_terminators()?;
 
         let else_branch = if matches!(self.current, Token::Else) {
             self.advance()?;
@@ -293,7 +295,7 @@ impl<'a> Parser<'a> {
         self.expect(Token::Do)?;
         self.skip_newlines()?;
         let body = Box::new(self.parse_stmt()?);
-        self.skip_newlines()?;
+        self.skip_terminators()?;
         self.expect(Token::While)?;
         self.expect(Token::LParen)?;
         let cond = self.parse_expr()?;
@@ -390,7 +392,21 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_assignment_from_var(&mut self, var_name: String) -> Result<Expr, ParseError> {
-        let var = Expr::Var(var_name);
+        let mut var = Expr::Var(var_name);
+
+        // Support array element as the for-init lvalue: for (a[i] = ...; ...)
+        if matches!(self.current, Token::LBracket) {
+            if let Expr::Var(name) = var {
+                self.advance()?;
+                let mut indices = vec![self.parse_expr()?];
+                while matches!(self.current, Token::Comma) {
+                    self.advance()?;
+                    indices.push(self.parse_expr()?);
+                }
+                self.expect(Token::RBracket)?;
+                var = Expr::ArrayAccess { name, indices };
+            }
+        }
 
         let op = match &self.current {
             Token::Assign => AssignOp::Assign,
@@ -440,6 +456,14 @@ impl<'a> Parser<'a> {
         };
         self.advance()?;
 
+        // `delete arr` (no subscript) deletes the whole array
+        if !matches!(self.current, Token::LBracket) {
+            return Ok(Stmt::Delete {
+                array,
+                indices: vec![],
+            });
+        }
+
         self.expect(Token::LBracket)?;
         let mut indices = vec![self.parse_expr()?];
         while matches!(self.current, Token::Comma) {
@@ -463,6 +487,13 @@ impl<'a> Parser<'a> {
             }
         }
 
+        // `print (a, b)` — the whole argument list in parentheses
+        if args.len() == 1 {
+            if let Expr::Grouping(list) = &args[0] {
+                args = list.clone();
+            }
+        }
+
         let output = self.parse_output_redir()?;
 
         Ok(Stmt::Print { args, output })
@@ -471,12 +502,22 @@ impl<'a> Parser<'a> {
     fn parse_printf(&mut self) -> Result<Stmt, ParseError> {
         self.expect(Token::Printf)?;
 
-        let format = self.parse_print_expr()?;
+        let mut format = self.parse_print_expr()?;
         let mut args = Vec::new();
 
         while matches!(self.current, Token::Comma) {
             self.advance()?;
             args.push(self.parse_print_expr()?);
+        }
+
+        // `printf(fmt, a, b)` — the whole argument list in parentheses
+        if let Expr::Grouping(list) = &format {
+            if !list.is_empty() {
+                let mut list = list.clone();
+                format = list.remove(0);
+                list.extend(args);
+                args = list;
+            }
         }
 
         let output = self.parse_output_redir()?;
@@ -513,6 +554,7 @@ impl<'a> Parser<'a> {
                 | Token::String(_)
                 | Token::Regex(_)
                 | Token::Identifier(_)
+                | Token::FuncName(_)
                 | Token::Dollar
                 | Token::LParen
                 | Token::Not
@@ -530,7 +572,31 @@ impl<'a> Parser<'a> {
 
     /// Parse expression for print (stops at > >> | which are redirects, not operators)
     fn parse_print_expr(&mut self) -> Result<Expr, ParseError> {
-        self.parse_print_ternary()
+        self.parse_print_assignment()
+    }
+
+    /// Assignments are valid in print argument lists: `print x = 5`
+    fn parse_print_assignment(&mut self) -> Result<Expr, ParseError> {
+        let expr = self.parse_print_ternary()?;
+
+        let op = match &self.current {
+            Token::Assign => AssignOp::Assign,
+            Token::PlusAssign => AssignOp::AddAssign,
+            Token::MinusAssign => AssignOp::SubAssign,
+            Token::StarAssign => AssignOp::MulAssign,
+            Token::SlashAssign => AssignOp::DivAssign,
+            Token::PercentAssign => AssignOp::ModAssign,
+            Token::CaretAssign => AssignOp::PowAssign,
+            _ => return Ok(expr),
+        };
+        self.advance()?;
+
+        let value = self.parse_print_assignment()?;
+        Ok(Expr::Assign {
+            target: Box::new(expr),
+            op,
+            value: Box::new(value),
+        })
     }
 
     fn parse_print_ternary(&mut self) -> Result<Expr, ParseError> {
@@ -584,23 +650,18 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_print_in(&mut self) -> Result<Expr, ParseError> {
-        let left = self.parse_print_match()?;
+        let mut left = self.parse_print_match()?;
 
-        if matches!(self.current, Token::In) {
+        while matches!(self.current, Token::In) {
             self.advance()?;
             let array = match &self.current {
                 Token::Identifier(n) => n.clone(),
                 _ => return Err(self.error("Expected array name")),
             };
             self.advance()?;
-            Ok(Expr::BinaryOp {
-                left: Box::new(left),
-                op: BinOp::In,
-                right: Box::new(Expr::Var(array)),
-            })
-        } else {
-            Ok(left)
+            left = make_in_expr(left, array);
         }
+        Ok(left)
     }
 
     fn parse_print_match(&mut self) -> Result<Expr, ParseError> {
@@ -673,6 +734,7 @@ impl<'a> Parser<'a> {
             Token::Number(_)
                 | Token::String(_)
                 | Token::Identifier(_)
+                | Token::FuncName(_)
                 | Token::Dollar
                 | Token::LParen
                 | Token::Getline
@@ -742,7 +804,8 @@ impl<'a> Parser<'a> {
         match &self.current {
             Token::Not => {
                 self.advance()?;
-                let expr = self.parse_print_unary()?;
+                // `!` binds looser than `^`: !x^2 == !(x^2)
+                let expr = self.parse_print_power()?;
                 Ok(Expr::UnaryOp {
                     op: UnaryOp::Not,
                     expr: Box::new(expr),
@@ -750,7 +813,8 @@ impl<'a> Parser<'a> {
             }
             Token::Minus => {
                 self.advance()?;
-                let expr = self.parse_print_unary()?;
+                // Unary minus binds looser than `^`: -2^2 == -(2^2)
+                let expr = self.parse_print_power()?;
                 Ok(Expr::UnaryOp {
                     op: UnaryOp::Neg,
                     expr: Box::new(expr),
@@ -758,7 +822,11 @@ impl<'a> Parser<'a> {
             }
             Token::Plus => {
                 self.advance()?;
-                self.parse_print_unary()
+                let expr = self.parse_print_power()?;
+                Ok(Expr::UnaryOp {
+                    op: UnaryOp::Pos,
+                    expr: Box::new(expr),
+                })
             }
             Token::PlusPlus => {
                 self.advance()?;
@@ -901,23 +969,18 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_in(&mut self) -> Result<Expr, ParseError> {
-        let left = self.parse_match()?;
+        let mut left = self.parse_match()?;
 
-        if matches!(self.current, Token::In) {
+        while matches!(self.current, Token::In) {
             self.advance()?;
             let array = match &self.current {
                 Token::Identifier(n) => n.clone(),
                 _ => return Err(self.error("Expected array name")),
             };
             self.advance()?;
-            Ok(Expr::BinaryOp {
-                left: Box::new(left),
-                op: BinOp::In,
-                right: Box::new(Expr::Var(array)),
-            })
-        } else {
-            Ok(left)
+            left = make_in_expr(left, array);
         }
+        Ok(left)
     }
 
     fn parse_match(&mut self) -> Result<Expr, ParseError> {
@@ -989,6 +1052,7 @@ impl<'a> Parser<'a> {
             Token::Number(_)
                 | Token::String(_)
                 | Token::Identifier(_)
+                | Token::FuncName(_)
                 | Token::Dollar
                 | Token::LParen
                 | Token::Getline
@@ -1058,7 +1122,8 @@ impl<'a> Parser<'a> {
         match &self.current {
             Token::Not => {
                 self.advance()?;
-                let expr = self.parse_unary()?;
+                // `!` binds looser than `^`: !x^2 == !(x^2)
+                let expr = self.parse_power()?;
                 Ok(Expr::UnaryOp {
                     op: UnaryOp::Not,
                     expr: Box::new(expr),
@@ -1066,7 +1131,8 @@ impl<'a> Parser<'a> {
             }
             Token::Minus => {
                 self.advance()?;
-                let expr = self.parse_unary()?;
+                // Unary minus binds looser than `^`: -2^2 == -(2^2)
+                let expr = self.parse_power()?;
                 Ok(Expr::UnaryOp {
                     op: UnaryOp::Neg,
                     expr: Box::new(expr),
@@ -1074,7 +1140,11 @@ impl<'a> Parser<'a> {
             }
             Token::Plus => {
                 self.advance()?;
-                self.parse_unary()
+                let expr = self.parse_power()?;
+                Ok(Expr::UnaryOp {
+                    op: UnaryOp::Pos,
+                    expr: Box::new(expr),
+                })
             }
             Token::PlusPlus => {
                 self.advance()?;
@@ -1135,14 +1205,8 @@ impl<'a> Parser<'a> {
                     if matches!(self.current, Token::Getline) {
                         self.advance()?;
 
-                        // Optional variable name
-                        let var = if let Token::Identifier(v) = &self.current {
-                            let v = v.clone();
-                            self.advance()?;
-                            Some(v)
-                        } else {
-                            None
-                        };
+                        // Optional lvalue (variable, array element, or field)
+                        let var = self.parse_getline_lvalue()?;
 
                         expr = Expr::Getline {
                             var,
@@ -1191,26 +1255,43 @@ impl<'a> Parser<'a> {
             Token::LParen => {
                 self.advance()?;
                 let expr = self.parse_expr()?;
-                self.expect(Token::RParen)?;
-                Ok(expr)
+                if matches!(self.current, Token::Comma) {
+                    // Parenthesized expression list: `(i, j)` — valid before
+                    // `in` or as a print/printf argument list.
+                    let mut list = vec![expr];
+                    while matches!(self.current, Token::Comma) {
+                        self.advance()?;
+                        self.skip_newlines()?;
+                        list.push(self.parse_expr()?);
+                    }
+                    self.expect(Token::RParen)?;
+                    Ok(Expr::Grouping(list))
+                } else {
+                    self.expect(Token::RParen)?;
+                    Ok(expr)
+                }
+            }
+            Token::FuncName(name) => {
+                let name = name.clone();
+                self.advance()?;
+                self.parse_call_args(name)
             }
             Token::Identifier(name) => {
                 let name = name.clone();
                 self.advance()?;
 
-                // Check for function call
-                if matches!(self.current, Token::LParen) {
-                    self.advance()?;
-                    let mut args = Vec::new();
-                    if !matches!(self.current, Token::RParen) {
-                        args.push(self.parse_expr()?);
-                        while matches!(self.current, Token::Comma) {
-                            self.advance()?;
-                            args.push(self.parse_expr()?);
-                        }
-                    }
-                    self.expect(Token::RParen)?;
-                    Ok(Expr::Call { name, args })
+                if matches!(self.current, Token::LParen) && crate::builtins::is_builtin_name(&name)
+                {
+                    // Builtins may have whitespace before '(' (POSIX grammar
+                    // treats them as separate tokens). For user identifiers,
+                    // `name (expr)` is concatenation instead.
+                    self.parse_call_args(name)
+                } else if name == "length" {
+                    // `length` without parentheses means length($0)
+                    Ok(Expr::Call {
+                        name,
+                        args: Vec::new(),
+                    })
                 } else {
                     Ok(Expr::Var(name))
                 }
@@ -1218,13 +1299,7 @@ impl<'a> Parser<'a> {
             Token::Getline => {
                 self.advance()?;
 
-                let var = if let Token::Identifier(v) = &self.current {
-                    let v = v.clone();
-                    self.advance()?;
-                    Some(v)
-                } else {
-                    None
-                };
+                let var = self.parse_getline_lvalue()?;
 
                 // Check for < file
                 let file = if matches!(self.current, Token::Lt) {
@@ -1242,6 +1317,64 @@ impl<'a> Parser<'a> {
             }
             _ => Err(self.error(&format!("Unexpected token: {:?}", self.current))),
         }
+    }
+
+    /// Parse the parenthesized argument list of a function call.
+    fn parse_call_args(&mut self, name: String) -> Result<Expr, ParseError> {
+        self.expect(Token::LParen)?;
+        let mut args = Vec::new();
+        if !matches!(self.current, Token::RParen) {
+            args.push(self.parse_expr()?);
+            while matches!(self.current, Token::Comma) {
+                self.advance()?;
+                self.skip_newlines()?;
+                args.push(self.parse_expr()?);
+            }
+        }
+        self.expect(Token::RParen)?;
+        Ok(Expr::Call { name, args })
+    }
+
+    /// Parse the optional lvalue after `getline`:
+    /// a variable, an array element, or a field ($n).
+    fn parse_getline_lvalue(&mut self) -> Result<Option<Box<Expr>>, ParseError> {
+        match &self.current {
+            Token::Identifier(v) => {
+                let name = v.clone();
+                self.advance()?;
+                if matches!(self.current, Token::LBracket) {
+                    self.advance()?;
+                    let mut indices = vec![self.parse_expr()?];
+                    while matches!(self.current, Token::Comma) {
+                        self.advance()?;
+                        indices.push(self.parse_expr()?);
+                    }
+                    self.expect(Token::RBracket)?;
+                    Ok(Some(Box::new(Expr::ArrayAccess { name, indices })))
+                } else {
+                    Ok(Some(Box::new(Expr::Var(name))))
+                }
+            }
+            Token::Dollar => {
+                self.advance()?;
+                let idx = self.parse_unary()?;
+                Ok(Some(Box::new(Expr::Field(Box::new(idx)))))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+/// Build an `in` expression, expanding a parenthesized index list
+/// `(i, j) in arr` into a multidimensional membership test.
+fn make_in_expr(left: Expr, array: String) -> Expr {
+    match left {
+        Expr::Grouping(indices) => Expr::InArray { indices, array },
+        other => Expr::BinaryOp {
+            left: Box::new(other),
+            op: BinOp::In,
+            right: Box::new(Expr::Var(array)),
+        },
     }
 }
 

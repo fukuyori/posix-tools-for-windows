@@ -11,6 +11,10 @@ pub enum Token {
 
     // Identifiers and keywords
     Identifier(String),
+    /// Identifier immediately followed by `(` (no intervening space).
+    /// Per POSIX this distinguishes a function call `f(x)` from
+    /// concatenation with a parenthesized expression `f (x)`.
+    FuncName(String),
     Begin,
     End,
     If,
@@ -191,19 +195,18 @@ impl<'a> Lexer<'a> {
             }
         }
 
-        // Decimal part
+        // Decimal part ("5.25", "5." and ".5" are all valid numbers)
         if self.current_char == Some('.') {
-            if let Some(next) = self.peek() {
-                if next.is_ascii_digit() {
-                    num_str.push('.');
-                    self.advance();
-                    while let Some(c) = self.current_char {
-                        if c.is_ascii_digit() {
-                            num_str.push(c);
-                            self.advance();
-                        } else {
-                            break;
-                        }
+            let next_is_digit = self.peek().is_some_and(|c| c.is_ascii_digit());
+            if next_is_digit || !num_str.is_empty() {
+                num_str.push('.');
+                self.advance();
+                while let Some(c) = self.current_char {
+                    if c.is_ascii_digit() {
+                        num_str.push(c);
+                        self.advance();
+                    } else {
+                        break;
                     }
                 }
             }
@@ -256,9 +259,28 @@ impl<'a> Lexer<'a> {
                         Some('\\') => s.push('\\'),
                         Some('"') => s.push('"'),
                         Some('/') => s.push('/'),
+                        Some('a') => s.push('\x07'),
                         Some('b') => s.push('\x08'),
                         Some('f') => s.push('\x0c'),
-                        Some(c) => s.push(c),
+                        Some('v') => s.push('\x0b'),
+                        Some(c @ '0'..='7') => {
+                            // Octal escape: \d, \dd, or \ddd
+                            let mut code = c as u32 - '0' as u32;
+                            for _ in 0..2 {
+                                match self.peek() {
+                                    Some(d @ '0'..='7') => {
+                                        code = code * 8 + (d as u32 - '0' as u32);
+                                        self.advance();
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            s.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                        }
+                        Some(c) => {
+                            s.push('\\');
+                            s.push(c);
+                        }
                         None => return Err(self.error("Unexpected end of input in string")),
                     }
                     self.advance();
@@ -331,12 +353,21 @@ impl<'a> Lexer<'a> {
             "nextfile" => Token::NextFile,
             "exit" => Token::Exit,
             "return" => Token::Return,
-            "function" => Token::Function,
+            "function" | "func" => Token::Function,
             "delete" => Token::Delete,
             "print" => Token::Print,
             "printf" => Token::Printf,
             "getline" => Token::Getline,
-            _ => Token::Identifier(ident),
+            _ => {
+                // POSIX: an identifier immediately followed by '(' (no space)
+                // is a function name; with intervening space it is a variable
+                // reference (possibly concatenated with a grouped expression).
+                if self.current_char == Some('(') {
+                    Token::FuncName(ident)
+                } else {
+                    Token::Identifier(ident)
+                }
+            }
         }
     }
 
@@ -456,11 +487,22 @@ impl<'a> Lexer<'a> {
                 }
                 '*' => {
                     self.advance();
-                    if self.current_char == Some('=') {
-                        self.advance();
-                        Ok(Token::StarAssign)
-                    } else {
-                        Ok(Token::Star)
+                    match self.current_char {
+                        Some('=') => {
+                            self.advance();
+                            Ok(Token::StarAssign)
+                        }
+                        // `**` and `**=` as aliases for `^` and `^=`
+                        Some('*') => {
+                            self.advance();
+                            if self.current_char == Some('=') {
+                                self.advance();
+                                Ok(Token::CaretAssign)
+                            } else {
+                                Ok(Token::Caret)
+                            }
+                        }
+                        _ => Ok(Token::Star),
                     }
                 }
                 '%' => {

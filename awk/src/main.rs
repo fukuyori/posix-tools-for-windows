@@ -28,7 +28,7 @@ fn print_usage() {
 }
 
 fn print_version() {
-    eprintln!("awk-rs 0.2.0");
+    eprintln!("awk-rs 1.0.0");
     eprintln!("Rust で実装された POSIX AWK");
 }
 
@@ -49,20 +49,43 @@ where
     I: IntoIterator<Item = String>,
 {
     let args: Vec<String> = args.into_iter().collect();
-    let argv0 = args.first().cloned().unwrap_or_else(|| "awk".to_string());
     let mut config = Config {
         program: String::new(),
         files: Vec::new(),
-        awk_argv: vec![argv0],
+        // POSIX: ARGV[0] is the name of the awk utility, not its full path
+        awk_argv: vec!["awk".to_string()],
         field_separator: None,
         variables: Vec::new(),
     };
 
     let mut i = 1;
     let mut program_set = false;
+    let mut options_done = false;
 
     while i < args.len() {
         let arg = &args[i];
+
+        if !options_done && arg == "--" {
+            options_done = true;
+            i += 1;
+            continue;
+        }
+
+        if options_done || !arg.starts_with('-') || arg == "-" {
+            if !program_set {
+                config.program = arg.clone();
+                program_set = true;
+            } else if parse_assignment_operand(arg).is_some() {
+                // var=value operand: keep literally (no glob expansion)
+                config.files.push(arg.clone());
+            } else {
+                let expanded = expand_path_argument(arg)
+                    .map_err(|e| format!("入力ファイル '{}' を展開できません: {}", arg, e))?;
+                config.files.extend(expanded);
+            }
+            i += 1;
+            continue;
+        }
 
         if arg == "--help" {
             print_usage();
@@ -75,27 +98,23 @@ where
             if i >= args.len() {
                 return Err("-F には引数が必要です".to_string());
             }
-            config.field_separator = Some(args[i].clone());
+            config.field_separator = Some(process_escapes(&args[i]));
         } else if arg.starts_with("-F") {
-            config.field_separator = Some(arg[2..].to_string());
+            config.field_separator = Some(process_escapes(&arg[2..]));
         } else if arg == "-v" {
             i += 1;
             if i >= args.len() {
                 return Err("-v には引数が必要です".to_string());
             }
             let assignment = &args[i];
-            if let Some(eq_pos) = assignment.find('=') {
-                let name = assignment[..eq_pos].to_string();
-                let value = assignment[eq_pos + 1..].to_string();
+            if let Some((name, value)) = parse_assignment_operand(assignment) {
                 config.variables.push((name, value));
             } else {
                 return Err(format!("無効な変数代入: {}", assignment));
             }
         } else if arg.starts_with("-v") {
             let assignment = &arg[2..];
-            if let Some(eq_pos) = assignment.find('=') {
-                let name = assignment[..eq_pos].to_string();
-                let value = assignment[eq_pos + 1..].to_string();
+            if let Some((name, value)) = parse_assignment_operand(assignment) {
                 config.variables.push((name, value));
             } else {
                 return Err(format!("無効な変数代入: {}", assignment));
@@ -123,15 +142,8 @@ where
             config.program.push_str(&program);
             config.program.push('\n');
             program_set = true;
-        } else if arg.starts_with('-') && arg != "-" {
-            return Err(format!("不明なオプション: {}", arg));
-        } else if !program_set {
-            config.program = arg.clone();
-            program_set = true;
         } else {
-            let expanded = expand_path_argument(arg)
-                .map_err(|e| format!("入力ファイル '{}' を展開できません: {}", arg, e))?;
-            config.files.extend(expanded);
+            return Err(format!("不明なオプション: {}", arg));
         }
 
         i += 1;
@@ -144,6 +156,66 @@ where
     }
 
     Ok(config)
+}
+
+/// Process escape sequences in -v/-F/command-line assignment values
+/// (POSIX: these undergo the same processing as string literals).
+fn process_escapes(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            Some('"') => out.push('"'),
+            Some('/') => out.push('/'),
+            Some('a') => out.push('\x07'),
+            Some('b') => out.push('\x08'),
+            Some('f') => out.push('\x0c'),
+            Some('v') => out.push('\x0b'),
+            Some(d @ '0'..='7') => {
+                let mut code = d as u32 - '0' as u32;
+                for _ in 0..2 {
+                    match chars.peek() {
+                        Some(&e @ '0'..='7') => {
+                            code = code * 8 + (e as u32 - '0' as u32);
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+            }
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Check whether a command-line operand is a `var=value` assignment.
+/// Returns (name, value) with escape processing applied to the value.
+fn parse_assignment_operand(arg: &str) -> Option<(String, String)> {
+    let eq = arg.find('=')?;
+    let name = &arg[..eq];
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some((name.to_string(), process_escapes(&arg[eq + 1..])))
 }
 
 fn expand_path_argument(arg: &str) -> Result<Vec<String>, glob::PatternError> {
@@ -191,35 +263,54 @@ fn run(config: Config) -> Result<i32, String> {
         interp.set_var(name, value);
     }
 
-    if let Some(code) = interp
+    let begin_exited = interp
         .run_begin_rules()
         .map_err(|e| format!("実行エラー: {}", e))?
-    {
-        return Ok(code);
-    }
+        .is_some();
 
-    let files = interp.input_file_args();
-    if files.is_empty() {
-        let stdin = io::stdin();
-        let reader = BufReader::new(stdin.lock());
-        interp
-            .run(reader, "-")
-            .map_err(|e| format!("実行エラー: {}", e))?;
-    } else {
-        for filename in &files {
-            if filename == "-" {
+    if !begin_exited {
+        let operands = interp.input_file_args();
+        // File operands, excluding var=value assignments
+        let has_real_file = operands.iter().any(|o| parse_assignment_operand(o).is_none());
+
+        if !has_real_file {
+            // Apply any assignment operands, then read stdin
+            for operand in &operands {
+                if let Some((name, value)) = parse_assignment_operand(operand) {
+                    interp.set_var(&name, &value);
+                }
+            }
+            let uses_stdin = program_reads_input(&program);
+            if uses_stdin {
                 let stdin = io::stdin();
                 let reader = BufReader::new(stdin.lock());
                 interp
                     .run(reader, "-")
                     .map_err(|e| format!("実行エラー: {}", e))?;
-            } else {
-                let file = File::open(filename)
-                    .map_err(|e| format!("'{}' を開けません: {}", filename, e))?;
-                let reader = BufReader::new(file);
-                interp
-                    .run(reader, filename)
-                    .map_err(|e| format!("実行エラー: {}", e))?;
+            }
+        } else {
+            for operand in &operands {
+                if interp.has_exited() {
+                    break;
+                }
+                if let Some((name, value)) = parse_assignment_operand(operand) {
+                    // Assignment operand: takes effect at this point
+                    // in the file sequence
+                    interp.set_var(&name, &value);
+                } else if operand == "-" {
+                    let stdin = io::stdin();
+                    let reader = BufReader::new(stdin.lock());
+                    interp
+                        .run(reader, "-")
+                        .map_err(|e| format!("実行エラー: {}", e))?;
+                } else {
+                    let file = File::open(operand)
+                        .map_err(|e| format!("'{}' を開けません: {}", operand, e))?;
+                    let reader = BufReader::new(file);
+                    interp
+                        .run(reader, operand)
+                        .map_err(|e| format!("実行エラー: {}", e))?;
+                }
             }
         }
     }
@@ -228,7 +319,19 @@ fn run(config: Config) -> Result<i32, String> {
         .run_end_rules()
         .map_err(|e| format!("実行エラー: {}", e))?;
 
+    // Wait for pipe children and flush files before exiting
+    interp.close_all_outputs();
+
     Ok(interp.exit_code())
+}
+
+/// A program consisting only of BEGIN rules never reads input;
+/// anything else (main rules or END rules) consumes stdin.
+fn program_reads_input(program: &ast::Program) -> bool {
+    program
+        .rules
+        .iter()
+        .any(|r| !matches!(r.pattern, Some(ast::Pattern::Begin)))
 }
 
 fn main() {
@@ -423,6 +526,44 @@ mod tests {
             "",
         );
         assert_eq!(result, "1 bar foo\n2 bar f00\n");
+    }
+
+    #[test]
+    fn test_sub_with_regex_literal_pattern() {
+        // sub/gsub の第1引数が `/.../` 形式の regex リテラルの場合、
+        // パターンソースをそのまま正規表現として使うこと（POSIX `$0` への暗黙マッチ評価を抑止）。
+        let result = run_awk(
+            "{ r = sub(/abc/, \"X\"); print \"ret:\", r, \"line:\", $0 }",
+            "abcdef\n",
+        );
+        assert_eq!(result, "ret: 1 line: Xdef\n");
+    }
+
+    #[test]
+    fn test_gsub_with_regex_literal_pattern() {
+        let result = run_awk(
+            "BEGIN { s = \"a-b-c\"; n = gsub(/-/, \"_\", s); print n, s }",
+            "",
+        );
+        assert_eq!(result, "2 a_b_c\n");
+    }
+
+    #[test]
+    fn test_match_with_regex_literal_pattern() {
+        let result = run_awk(
+            "BEGIN { print match(\"hello world\", /o w/), RSTART, RLENGTH }",
+            "",
+        );
+        assert_eq!(result, "5 5 3\n");
+    }
+
+    #[test]
+    fn test_split_with_regex_literal_separator() {
+        let result = run_awk(
+            "BEGIN { n = split(\"1,2;3,4\", a, /[,;]/); for (i=1;i<=n;i++) print a[i] }",
+            "",
+        );
+        assert_eq!(result, "1\n2\n3\n4\n");
     }
 
     #[test]
@@ -723,6 +864,216 @@ mod tests {
     fn test_string_concat() {
         let result = run_awk("BEGIN { a = \"hello\"; b = \"world\"; print a b }", "");
         assert_eq!(result, "helloworld\n");
+    }
+
+    #[test]
+    fn test_ors_is_honored() {
+        let result = run_awk("BEGIN{ORS=\"|\"}{print}", "a\nb\n");
+        assert_eq!(result, "a|b|");
+    }
+
+    #[test]
+    fn test_if_semicolon_before_else() {
+        let result = run_awk("BEGIN{if (0) print \"a\"; else print \"b\"}", "");
+        assert_eq!(result, "b\n");
+    }
+
+    #[test]
+    fn test_exit_in_begin_still_runs_end() {
+        let result = run_awk("BEGIN{exit 0} END{print \"end\"}", "");
+        assert_eq!(result, "end\n");
+    }
+
+    #[test]
+    fn test_exit_in_main_runs_end_once() {
+        let result = run_awk("NR==1{exit} {print \"no\"} END{print \"end\"}", "a\nb\n");
+        assert_eq!(result, "end\n");
+    }
+
+    #[test]
+    fn test_array_passed_by_reference() {
+        let result = run_awk(
+            "function f(arr) {arr[\"k\"]=\"v\"} BEGIN{f(a); print a[\"k\"]}",
+            "",
+        );
+        assert_eq!(result, "v\n");
+    }
+
+    #[test]
+    fn test_local_array_parameter_supports_recursion() {
+        let result = run_awk(
+            "function f(n,  tmp) { split(\"x y\", tmp); if (n > 0) f(n - 1); return tmp[1] } \
+             BEGIN { print f(2) }",
+            "",
+        );
+        assert_eq!(result, "x\n");
+    }
+
+    #[test]
+    fn test_space_before_paren_is_concatenation() {
+        let result = run_awk(
+            "function f(a, b) {return a (b==\"\" ? \"-\" : b)} BEGIN{print f(\"x\")}",
+            "",
+        );
+        assert_eq!(result, "x-\n");
+    }
+
+    #[test]
+    fn test_length_of_array_and_bare_length() {
+        let result = run_awk("BEGIN{a[1]=1;a[2]=2;print length(a)}", "");
+        assert_eq!(result, "2\n");
+        let result = run_awk("{print length}", "hello\n");
+        assert_eq!(result, "5\n");
+    }
+
+    #[test]
+    fn test_delete_whole_array() {
+        let result = run_awk("BEGIN{a[1]=1; a[2]=2; delete a; print length(a)}", "");
+        assert_eq!(result, "0\n");
+    }
+
+    #[test]
+    fn test_multidim_in_operator() {
+        let result = run_awk("BEGIN{a[1,2]=3; print ((1,2) in a), ((9,9) in a)}", "");
+        assert_eq!(result, "1 0\n");
+    }
+
+    #[test]
+    fn test_unary_minus_binds_looser_than_power() {
+        let result = run_awk("BEGIN{print -2^2, 2^-1}", "");
+        assert_eq!(result, "-4 0.5\n");
+    }
+
+    #[test]
+    fn test_unary_plus_coerces_to_number() {
+        let result = run_awk("BEGIN{x=\"3abc\"; print +x}", "");
+        assert_eq!(result, "3\n");
+    }
+
+    #[test]
+    fn test_print_assignment_expression() {
+        let result = run_awk("BEGIN{print x = 5; print x}", "");
+        assert_eq!(result, "5\n5\n");
+    }
+
+    #[test]
+    fn test_printf_parenthesized_args() {
+        let result = run_awk("BEGIN{printf(\"%d-%s\\n\", 7, \"y\")}", "");
+        assert_eq!(result, "7-y\n");
+    }
+
+    #[test]
+    fn test_getline_from_missing_file_returns_minus_one() {
+        let result = run_awk(
+            "BEGIN{r = (getline x < \"definitely_missing_file_xyz\"); print r}",
+            "",
+        );
+        assert_eq!(result, "-1\n");
+    }
+
+    #[test]
+    fn test_getline_var_from_file_does_not_touch_nr() {
+        let dir = std::env::temp_dir().join(format!(
+            "awk-rs-getline-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let data = dir.join("data.txt");
+        std::fs::write(&data, "zzz\n").unwrap();
+        let path = data.to_string_lossy().replace('\\', "/");
+        let prog = format!("{{getline line < \"{}\"; print NR, line}}", path);
+        let result = run_awk(&prog, "a\n");
+        assert_eq!(result, "1 zzz\n");
+        std::fs::remove_file(data).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn test_convfmt_applies_to_concatenation() {
+        let result = run_awk("BEGIN{CONVFMT=\"%.2g\"; x=3.14159; print x \"\"}", "");
+        assert_eq!(result, "3.1\n");
+    }
+
+    #[test]
+    fn test_ofmt_not_applied_to_integers() {
+        let result = run_awk("BEGIN{OFMT=\"%.2f\"; print 3.14159, 42}", "");
+        assert_eq!(result, "3.14 42\n");
+    }
+
+    #[test]
+    fn test_division_by_zero_is_error() {
+        let err = run_awk_result("BEGIN{print 1/0}", "").unwrap_err();
+        assert!(err.contains("division by zero"));
+    }
+
+    #[test]
+    fn test_negative_field_assignment_is_error() {
+        let err = run_awk_result("{$(-1)=\"x\"}", "a\n").unwrap_err();
+        assert!(err.contains("field -1"));
+    }
+
+    #[test]
+    fn test_multichar_rs_is_regex() {
+        let result = run_awk_with_setup("{print NR, $0}", "a1b22c", |interp| {
+            interp.set_var("RS", "[0-9]+");
+        });
+        assert_eq!(result, "1 a\n2 b\n3 c\n");
+    }
+
+    #[test]
+    fn test_paragraph_mode_newline_is_field_separator() {
+        let result = run_awk_with_setup("{print $2}", "x:1\ny:2\n\n", |interp| {
+            interp.set_var("RS", "");
+            interp.set_var("FS", ":");
+        });
+        assert_eq!(result, "1\n");
+    }
+
+    #[test]
+    fn test_numeric_string_comparison() {
+        let result = run_awk("{print ($1 == 10)}", "10.0\n");
+        assert_eq!(result, "1\n");
+        let result = run_awk("BEGIN{print (\"10\" == \"10.0\")}", "");
+        assert_eq!(result, "0\n");
+    }
+
+    #[test]
+    fn test_uninitialized_compares_equal_to_zero_and_empty() {
+        let result = run_awk("BEGIN{print (x == 0), (x == \"\")}", "");
+        assert_eq!(result, "1 1\n");
+    }
+
+    #[test]
+    fn test_substr_clamps_out_of_range_start() {
+        let result = run_awk(
+            "BEGIN{print substr(\"hello\", 0, 2) \"|\" substr(\"hello\", -1, 3) \"|\" substr(\"hello\", 10)}",
+            "",
+        );
+        assert_eq!(result, "h|h|\n");
+    }
+
+    #[test]
+    fn test_exit_inside_function() {
+        let result = run_awk(
+            "function die() { exit 3 } NR==1 { die(); print \"no\" } END { print \"end\" }",
+            "a\nb\n",
+        );
+        assert_eq!(result, "end\n");
+    }
+
+    #[test]
+    fn test_func_keyword_alias() {
+        let result = run_awk("func f() {return 9} BEGIN{print f()}", "");
+        assert_eq!(result, "9\n");
+    }
+
+    #[test]
+    fn test_getline_into_array_element() {
+        let result = run_awk("NR==1{getline a[\"x\"]; print a[\"x\"]}", "one\ntwo\n");
+        assert_eq!(result, "two\n");
     }
 
     #[test]

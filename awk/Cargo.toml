@@ -1,6 +1,6 @@
 [package]
 name = "awk-rs"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/fukuyori/posix-tools-for-windows.git"
@@ -8,8 +8,6 @@ description = "POSIX AWK implementation in Rust"
 
 [dependencies]
 glob = "0.3"
-regex = "1"
-thiserror = "1"
 
 [[bin]]
 name = "awk"
