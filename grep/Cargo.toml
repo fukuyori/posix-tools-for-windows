@@ -1,6 +1,6 @@
 [package]
 name = "grep"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "POSIX準拠のgrepコマンド（Windows用）"
 authors = ["Claude"]

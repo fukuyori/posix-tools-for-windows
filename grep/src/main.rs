@@ -19,7 +19,8 @@ struct Options {
     count: bool,                  // -c: マッチ行数のみ表示
     line_number: bool,            // -n: 行番号を表示
     files_with_matches: bool,     // -l: マッチしたファイル名のみ
-    quiet: bool,                  // -q, -s: 出力なし（終了コードのみ）
+    quiet: bool,                  // -q: 出力なし（終了コードのみ）
+    no_messages: bool,            // -s: ファイルエラーのメッセージを抑制
     extended_regexp: bool,        // -E: 拡張正規表現 (egrep)
     fixed_strings: bool,          // -F: 固定文字列 (fgrep)
     basic_regexp: bool,           // -G: 基本正規表現（デフォルト）
@@ -44,6 +45,9 @@ struct Options {
     include_patterns: Vec<String>, // --include: 含めるファイルパターン
     exclude_patterns: Vec<String>, // --exclude: 除外するファイルパターン
     exclude_dir: Vec<String>,      // --exclude-dir: 除外するディレクトリ
+    exclude_from: Vec<String>,     // --exclude-from: 除外パターンのファイル
+    directories: DirAction,        // -d, --directories: ディレクトリの扱い
+    group_separator: Option<String>, // --group-separator (None = 出力しない)
     label: Option<String>,         // --label: 標準入力のラベル
     initial_tab: bool,             // -T: TABで位置揃え
     text: bool,                    // -a, --text: バイナリをテキストとして扱う
@@ -53,6 +57,8 @@ struct Options {
     // 特殊
     show_help: bool,
     show_version: bool,
+    /// -r でファイル省略時（暗黙の "."）は GNU 同様 "./" プレフィックスを付けない
+    strip_dot_prefix: bool,
 }
 
 /// 色付けモード
@@ -73,17 +79,27 @@ enum BinaryMode {
     Without, // スキップ
 }
 
+/// ディレクトリの扱い (-d, --directories)
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+enum DirAction {
+    #[default]
+    Read, // デフォルト: エラーを表示（POSIX の「読む」相当）
+    Skip, // 黙ってスキップ
+}
+
 /// 検索結果
 struct GrepResult {
     matches: usize,
     files_matched: usize,
     had_error: bool,
+    /// 直前までに通常の行出力があったか（コンテキスト時のファイル間 -- 用）
+    printed_output: bool,
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    let opts = match parse_args(&args) {
+    let mut opts = match parse_args(&args) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("grep: {}", e);
@@ -98,19 +114,48 @@ fn main() {
     }
 
     if opts.show_version {
-        println!("grep 1.0.0 (Rust for Windows)");
+        println!("grep 1.1.0 (Rust for Windows)");
         std::process::exit(0);
+    }
+
+    // --exclude-from のパターンを読み込む
+    for path in std::mem::take(&mut opts.exclude_from) {
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                for line in content.lines() {
+                    if !line.is_empty() {
+                        opts.exclude_patterns.push(line.to_string());
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("grep: {}: {}", path, e);
+                std::process::exit(2);
+            }
+        }
     }
 
     // パターンを収集
     let patterns = collect_patterns(&opts);
     if patterns.is_empty() {
+        // -f で空のパターンファイルが指定された場合、GNU 互換で
+        // 「何にもマッチしない」= 終了コード 1
+        if opts.pattern_file.is_some() {
+            std::process::exit(1);
+        }
         eprintln!("grep: パターンを指定してください");
         std::process::exit(2);
     }
 
     // ファイルリストを取得
-    let files = collect_files(&opts);
+    let mut files = collect_files(&opts);
+
+    // GNU 互換: -r でファイル省略時はカレントディレクトリを検索
+    // （このとき出力パスに "./" プレフィックスを付けない）
+    if files.is_empty() && opts.recursive {
+        files.push(".".to_string());
+        opts.strip_dot_prefix = true;
+    }
 
     // 正規表現をビルド
     let regex = match build_regex(&patterns, &opts) {
@@ -126,6 +171,10 @@ fn main() {
 
     // 終了コード
     // 0: マッチあり, 1: マッチなし, 2: エラー
+    // ただし -q はマッチがあれば、エラーがあっても 0（GNU 互換）
+    if opts.quiet && result.matches > 0 {
+        std::process::exit(0);
+    }
     if result.had_error {
         std::process::exit(2);
     } else if result.matches > 0 {
@@ -139,6 +188,7 @@ fn main() {
 fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut opts = Options {
         color: ColorMode::Auto,
+        group_separator: Some("--".to_string()),
         ..Default::default()
     };
     let mut positional: Vec<String> = Vec::new();
@@ -221,11 +271,13 @@ fn parse_long_option(
             opts.pattern_file = Some(val);
         }
         "ignore-case" => opts.ignore_case = true,
+        "no-ignore-case" => opts.ignore_case = false,
         "invert-match" => opts.invert_match = true,
         "count" => opts.count = true,
         "line-number" => opts.line_number = true,
         "files-with-matches" => opts.files_with_matches = true,
         "quiet" | "silent" => opts.quiet = true,
+        "no-messages" => opts.no_messages = true,
         "extended-regexp" => opts.extended_regexp = true,
         "fixed-strings" => opts.fixed_strings = true,
         "basic-regexp" => opts.basic_regexp = true,
@@ -278,6 +330,27 @@ fn parse_long_option(
             let val = get_option_value("--exclude-dir", value, args, i)?;
             opts.exclude_dir.push(val);
         }
+        "exclude-from" => {
+            let val = get_option_value("--exclude-from", value, args, i)?;
+            opts.exclude_from.push(val);
+        }
+        "directories" => {
+            let val = get_option_value("--directories", value, args, i)?;
+            apply_dir_action(&val, opts)?;
+        }
+        "devices" => {
+            let val = get_option_value("--devices", value, args, i)?;
+            if val != "read" && val != "skip" {
+                return Err(format!("'--devices' の値が不正です: '{}'", val));
+            }
+        }
+        "group-separator" => {
+            let val = get_option_value("--group-separator", value, args, i)?;
+            opts.group_separator = Some(val);
+        }
+        "no-group-separator" => opts.group_separator = None,
+        // 互換のため受理して無視するオプション
+        "line-buffered" | "mmap" | "unix-byte-offsets" | "binary" => {}
         "label" => {
             let val = get_option_value("--label", value, args, i)?;
             opts.label = Some(val);
@@ -332,13 +405,13 @@ fn parse_short_options(
                 opts.pattern_file = Some(val);
                 return Ok(());
             }
-            'i' => opts.ignore_case = true,
+            'i' | 'y' => opts.ignore_case = true, // -y は -i の旧式の同義語
             'v' => opts.invert_match = true,
             'c' => opts.count = true,
             'n' => opts.line_number = true,
             'l' => opts.files_with_matches = true,
             'q' => opts.quiet = true,
-            's' => opts.quiet = true, // POSIX: suppress error messages
+            's' => opts.no_messages = true, // POSIX: エラーメッセージのみ抑制
             'E' => opts.extended_regexp = true,
             'F' => opts.fixed_strings = true,
             'G' => opts.basic_regexp = true,
@@ -364,8 +437,23 @@ fn parse_short_options(
             'z' => opts.null_data = true,
             'Z' => opts.null_output = true,
             'T' => opts.initial_tab = true,
+            'I' => opts.binary_files = BinaryMode::Without,
+            'U' | 'u' => {} // --binary / --unix-byte-offsets: 互換のため受理して無視
+            'V' => opts.show_version = true,
 
             // 値を取るオプション
+            'd' => {
+                let val = get_short_option_value(c, &chars, j, args, i)?;
+                apply_dir_action(&val, opts)?;
+                return Ok(());
+            }
+            'D' => {
+                let val = get_short_option_value(c, &chars, j, args, i)?;
+                if val != "read" && val != "skip" {
+                    return Err(format!("オプション '-D' の値が不正です: '{}'", val));
+                }
+                return Ok(());
+            }
             'm' => {
                 let val = get_short_option_value(c, &chars, j, args, i)?;
                 opts.max_count = Some(
@@ -453,6 +541,17 @@ fn get_short_option_value(
     }
 }
 
+/// -d / --directories の値を適用
+fn apply_dir_action(val: &str, opts: &mut Options) -> Result<(), String> {
+    match val {
+        "read" => opts.directories = DirAction::Read,
+        "skip" => opts.directories = DirAction::Skip,
+        "recurse" => opts.recursive = true, // -d recurse は -r と同義
+        _ => return Err(format!("'--directories' の値が不正です: '{}'", val)),
+    }
+    Ok(())
+}
+
 /// 色モードを解析
 fn parse_color_mode(s: &str) -> Result<ColorMode, String> {
     match s {
@@ -463,31 +562,37 @@ fn parse_color_mode(s: &str) -> Result<ColorMode, String> {
     }
 }
 
-/// パターンを収集
+/// パターンを収集。
+/// GNU 互換: -e / 位置引数のパターン内の改行はパターン区切り（OR）として扱い、
+/// -f のパターンファイルでは空行も「全行にマッチする空パターン」として保持する。
 fn collect_patterns(opts: &Options) -> Vec<String> {
-    let mut patterns: Vec<String> = opts
+    let mut patterns: Vec<String> = Vec::new();
+
+    for p in opts
         .patterns
         .iter()
         .filter(|p| !p.starts_with("\x00FILE:"))
-        .cloned()
-        .collect();
+    {
+        for part in p.split('\n') {
+            patterns.push(part.to_string());
+        }
+    }
 
     // -f オプションでパターンファイルから読み込み
     if let Some(ref path) = opts.pattern_file {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            for line in content.lines() {
-                if !line.is_empty() {
-                    patterns.push(line.to_string());
-                }
-            }
-        } else if path == "-" {
+        if path == "-" {
             // 標準入力からパターンを読む
             let stdin = io::stdin();
             for line in stdin.lock().lines().map_while(Result::ok) {
-                if !line.is_empty() {
-                    patterns.push(line);
-                }
+                patterns.push(line);
             }
+        } else if let Ok(content) = std::fs::read_to_string(path) {
+            for line in content.lines() {
+                patterns.push(line.to_string());
+            }
+        } else {
+            eprintln!("grep: {}: パターンファイルを読み込めません", path);
+            std::process::exit(2);
         }
     }
 
@@ -588,9 +693,9 @@ fn process_pattern(pattern: &str, opts: &Options) -> String {
     let mut pat = if opts.fixed_strings {
         // -F: 正規表現メタ文字をエスケープ
         regex::escape(pattern)
-    } else if opts.basic_regexp && !opts.extended_regexp {
-        // -G: 基本正規表現（BRE）をERE風に変換
-        // BREでは +, ?, |, (, ) はリテラル、\+, \?, \|, \(, \) がメタ
+    } else if !opts.extended_regexp && !opts.perl_regexp {
+        // デフォルト（および -G）: POSIX どおり基本正規表現（BRE）として解釈する。
+        // BREでは +, ?, |, (, ), {, } はリテラル、\+, \?, \|, \(, \) 等がメタ
         convert_bre_to_ere(pattern)
     } else {
         pattern.to_string()
@@ -623,18 +728,26 @@ fn convert_bre_to_ere(pattern: &str) -> String {
                     result.push(chars[i + 1]);
                     i += 2;
                 }
+                '<' | '>' => {
+                    // GNU 拡張 \< \> （単語境界）
+                    result.push_str(r"\b");
+                    i += 2;
+                }
                 _ => {
                     result.push(chars[i]);
-                    i += 1;
+                    result.push(chars[i + 1]);
+                    i += 2;
                 }
             }
-        } else if chars[i] == '(' || chars[i] == ')' || chars[i] == '{' || chars[i] == '}' {
-            // BREではリテラル、エスケープして残す
-            result.push('\\');
-            result.push(chars[i]);
-            i += 1;
         } else {
-            result.push(chars[i]);
+            match chars[i] {
+                // BREではリテラル、エスケープして残す
+                '(' | ')' | '{' | '}' | '+' | '?' | '|' => {
+                    result.push('\\');
+                    result.push(chars[i]);
+                }
+                _ => result.push(chars[i]),
+            }
             i += 1;
         }
     }
@@ -648,6 +761,7 @@ fn run_grep(regex: &Regex, files: &[String], opts: &Options) -> GrepResult {
         matches: 0,
         files_matched: 0,
         had_error: false,
+        printed_output: false,
     };
 
     // コンテキストオプションの調整
@@ -706,8 +820,12 @@ fn run_grep(regex: &Regex, files: &[String], opts: &Options) -> GrepResult {
                         before_ctx,
                         after_ctx,
                     );
+                } else if opts.directories == DirAction::Skip {
+                    // -d skip: 黙ってスキップ
                 } else {
-                    eprintln!("grep: {}: ディレクトリです", file);
+                    if !opts.no_messages {
+                        eprintln!("grep: {}: ディレクトリです", file);
+                    }
                     result.had_error = true;
                 }
             } else {
@@ -742,15 +860,34 @@ fn grep_single_file(
         return;
     }
 
-    match grep_file(path, regex, opts, show_filename, before_ctx, after_ctx) {
+    // コンテキスト表示時、直前のファイルの出力との間にグループ区切りを入れる
+    let context_active = before_ctx > 0 || after_ctx > 0;
+    let normal_output = !opts.quiet
+        && !opts.count
+        && !opts.files_with_matches
+        && !opts.files_without_match;
+    let file_sep_pending = context_active && normal_output && result.printed_output;
+
+    match grep_file(
+        path,
+        regex,
+        opts,
+        show_filename,
+        before_ctx,
+        after_ctx,
+        file_sep_pending,
+    ) {
         Ok(count) => {
             result.matches += count;
             if count > 0 {
                 result.files_matched += 1;
+                if normal_output {
+                    result.printed_output = true;
+                }
             }
         }
         Err(e) => {
-            if !opts.quiet {
+            if !opts.no_messages {
                 eprintln!("grep: {}: {}", path.display(), e);
             }
             result.had_error = true;
@@ -826,6 +963,27 @@ fn glob_match_path(pattern: &str, basename: &str, normalized_path: &str) -> bool
         .any(|candidate| glob_match(&normalized_pattern, candidate))
 }
 
+/// 行分割と各行の（デコード後の）バイトオフセットを計算する。
+/// 通常は改行区切り（CRLF の \r も除去）、-z では NUL 区切り。
+fn split_lines(content: &str, null_data: bool) -> (Vec<&str>, Vec<usize>) {
+    let sep = if null_data { '\0' } else { '\n' };
+    let mut lines = Vec::new();
+    let mut offsets = Vec::new();
+    let mut pos = 0usize;
+
+    for chunk in content.split_inclusive(sep) {
+        offsets.push(pos);
+        pos += chunk.len();
+        let mut line = chunk.strip_suffix(sep).unwrap_or(chunk);
+        if !null_data {
+            line = line.strip_suffix('\r').unwrap_or(line);
+        }
+        lines.push(line);
+    }
+
+    (lines, offsets)
+}
+
 /// 標準入力を検索
 fn grep_stdin(
     regex: &Regex,
@@ -839,13 +997,11 @@ fn grep_stdin(
     stdin.lock().read_to_end(&mut bytes)?;
 
     let content = decode_to_utf8(&bytes);
-    let lines: Vec<&str> = if opts.null_data {
-        content.split('\0').collect()
-    } else {
-        content.lines().collect()
-    };
+    let (lines, offsets) = split_lines(&content, opts.null_data);
 
-    grep_lines(&lines, regex, opts, label, before_ctx, after_ctx)
+    grep_lines(
+        &lines, &offsets, regex, opts, label, before_ctx, after_ctx, false,
+    )
 }
 
 /// ファイルを検索
@@ -856,13 +1012,14 @@ fn grep_file(
     show_filename: bool,
     before_ctx: usize,
     after_ctx: usize,
+    file_sep_pending: bool,
 ) -> io::Result<usize> {
     let mut file = File::open(path)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
 
-    // バイナリファイルチェック
-    if is_binary(&bytes) {
+    // バイナリファイルチェック（-z では NUL は区切り文字なので判定しない）
+    if !opts.null_data && is_binary(&bytes) {
         match opts.binary_files {
             BinaryMode::Without => return Ok(0),
             BinaryMode::Binary => {
@@ -883,25 +1040,33 @@ fn grep_file(
     }
 
     let content = decode_to_utf8(&bytes);
-    let lines: Vec<&str> = if opts.null_data {
-        content.split('\0').collect()
-    } else {
-        content.lines().collect()
-    };
+    let (lines, offsets) = split_lines(&content, opts.null_data);
 
     let filename = if show_filename {
-        Some(path.to_string_lossy().to_string())
+        let mut name = path.to_string_lossy().to_string();
+        // 再帰検索では GNU 同様 '/' 区切りで表示する
+        if opts.recursive {
+            name = name.replace('\\', "/");
+        }
+        if opts.strip_dot_prefix {
+            if let Some(stripped) = name.strip_prefix("./") {
+                name = stripped.to_string();
+            }
+        }
+        Some(name)
     } else {
         None
     };
 
     grep_lines(
         &lines,
+        &offsets,
         regex,
         opts,
         filename.as_deref(),
         before_ctx,
         after_ctx,
+        file_sep_pending,
     )
 }
 
@@ -918,7 +1083,7 @@ fn grep_directory(
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
-            if !opts.quiet {
+            if !opts.no_messages {
                 eprintln!("grep: {}: {}", dir.display(), e);
             }
             result.had_error = true;
@@ -930,7 +1095,7 @@ fn grep_directory(
         let entry = match entry_result {
             Ok(e) => e,
             Err(e) => {
-                if !opts.quiet {
+                if !opts.no_messages {
                     eprintln!(
                         "grep: '{}' 内のエントリを読み取れません: {}",
                         dir.display(),
@@ -942,6 +1107,15 @@ fn grep_directory(
             }
         };
         let path = entry.path();
+
+        // GNU 互換: -r は走査中のシンボリックリンクを辿らない（-R は辿る）
+        if !opts.dereference_recursive {
+            if let Ok(ft) = entry.file_type() {
+                if ft.is_symlink() {
+                    continue;
+                }
+            }
+        }
 
         if path.is_dir() {
             if should_process_dir(&path, opts) {
@@ -972,43 +1146,38 @@ fn grep_directory(
 /// 行を検索
 fn grep_lines(
     lines: &[&str],
+    byte_offsets: &[usize],
     regex: &Regex,
     opts: &Options,
     filename: Option<&str>,
     before_ctx: usize,
     after_ctx: usize,
+    file_sep_pending: bool,
 ) -> io::Result<usize> {
     let mut match_count = 0;
     let mut printed_lines: HashSet<usize> = HashSet::new();
     let mut pending_after: usize = 0;
     let mut last_printed_line: Option<usize> = None;
-    let mut byte_offset: usize = 0;
-    let mut byte_offsets: Vec<usize> = Vec::new();
-
-    // 各行のバイトオフセットを計算
-    for line in lines {
-        byte_offsets.push(byte_offset);
-        byte_offset += line.len() + 1; // +1 for newline
-    }
 
     // マッチ行を収集
-    let mut match_indices: Vec<usize> = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
+    let mut is_match_line: Vec<bool> = Vec::with_capacity(lines.len());
+    let mut total_matches = 0usize;
+    for line in lines.iter() {
         let is_match = regex.is_match(line);
         let should_match = if opts.invert_match {
             !is_match
         } else {
             is_match
         };
-
         if should_match {
-            match_indices.push(i);
+            total_matches += 1;
         }
+        is_match_line.push(should_match);
     }
 
     // -l: マッチしたファイル名のみ
     if opts.files_with_matches {
-        if !match_indices.is_empty() {
+        if total_matches > 0 {
             if let Some(f) = filename {
                 if !opts.quiet {
                     if opts.null_output {
@@ -1025,7 +1194,7 @@ fn grep_lines(
 
     // -L: マッチしないファイル名のみ
     if opts.files_without_match {
-        if match_indices.is_empty() {
+        if total_matches == 0 {
             if let Some(f) = filename {
                 if !opts.quiet {
                     if opts.null_output {
@@ -1043,15 +1212,16 @@ fn grep_lines(
     // -c: カウントのみ
     if opts.count {
         let count = if let Some(max) = opts.max_count {
-            match_indices.len().min(max)
+            total_matches.min(max)
         } else {
-            match_indices.len()
+            total_matches
         };
 
         if !opts.quiet {
             if let Some(f) = filename {
                 if opts.null_output {
-                    print!("{}:\0{}\n", f, count);
+                    // -Z: ファイル名の直後の ':' の代わりに NUL
+                    print!("{}\0{}\n", f, count);
                 } else {
                     println!("{}:{}", f, count);
                 }
@@ -1060,6 +1230,20 @@ fn grep_lines(
             }
         }
         return Ok(count);
+    }
+
+    // 各行から次のマッチ行までの距離（before-context 判定用、O(n) で前計算）
+    let mut next_match_dist: Vec<usize> = vec![usize::MAX; lines.len()];
+    {
+        let mut dist = usize::MAX;
+        for i in (0..lines.len()).rev() {
+            if is_match_line[i] {
+                dist = 0;
+            } else if dist != usize::MAX {
+                dist = dist.saturating_add(1);
+            }
+            next_match_dist[i] = dist;
+        }
     }
 
     // 色を使うか判定
@@ -1071,12 +1255,11 @@ fn grep_lines(
 
     // 通常出力
     for (i, line) in lines.iter().enumerate() {
-        let is_match_line = match_indices.contains(&i);
+        let is_match = is_match_line[i];
 
         // コンテキスト範囲内かチェック
-        let in_before_context = match_indices
-            .iter()
-            .any(|&m| i < m && i >= m.saturating_sub(before_ctx));
+        let in_before_context =
+            !is_match && next_match_dist[i] != usize::MAX && next_match_dist[i] <= before_ctx;
         let in_after_context = if let Some(last) = last_printed_line {
             pending_after > 0 && i > last
         } else {
@@ -1085,24 +1268,31 @@ fn grep_lines(
 
         let should_print_context = in_before_context || in_after_context;
 
-        if is_match_line {
+        // -m: 上限到達で読み取りを打ち切る
+        if is_match {
             if let Some(max) = opts.max_count {
                 if match_count >= max {
                     break;
                 }
             }
+        }
 
-            // セパレータ
-            if before_ctx > 0 || after_ctx > 0 {
-                if let Some(last) = last_printed_line {
-                    if i > last + 1 && !printed_lines.contains(&(i - 1)) {
-                        if !opts.quiet {
-                            println!("--");
-                        }
-                    }
+        // グループセパレータ: 出力が途切れた後に次のグループ（マッチ or コンテキスト）
+        // を印字する直前に出す。直前のファイルの出力との間にも出す。
+        let will_print = (is_match || should_print_context) && !printed_lines.contains(&i);
+        if will_print && (before_ctx > 0 || after_ctx > 0) {
+            let gap = match last_printed_line {
+                Some(last) => i > last + 1,
+                None => file_sep_pending,
+            };
+            if gap && !opts.quiet {
+                if let Some(ref sep) = opts.group_separator {
+                    println!("{}", sep);
                 }
             }
+        }
 
+        if is_match {
             if !printed_lines.contains(&i) {
                 print_line(
                     i,
@@ -1161,65 +1351,76 @@ fn print_line(
         return;
     }
 
+    // -z では出力レコードも NUL 終端（GNU 互換）
+    let eol = if opts.null_data { '\0' } else { '\n' };
     let sep = if is_match { ':' } else { '-' };
-    let mut prefix = String::new();
 
-    // ファイル名
-    if let Some(f) = filename {
-        if use_color {
-            prefix.push_str(&format!("\x1b[35m{}\x1b[0m", f));
-        } else {
-            prefix.push_str(f);
+    // マッチ単位のオフセットを使う -o -b のため、prefix を都度組み立てる
+    let build_prefix = |byte_off: usize| -> String {
+        let mut prefix = String::new();
+
+        // ファイル名
+        if let Some(f) = filename {
+            if use_color {
+                prefix.push_str(&format!("\x1b[35m{}\x1b[0m", f));
+            } else {
+                prefix.push_str(f);
+            }
+            if opts.null_output {
+                prefix.push('\0');
+            } else {
+                prefix.push(sep);
+            }
         }
-        if opts.null_output {
-            prefix.push('\0');
-        } else {
+
+        // 行番号
+        if opts.line_number {
+            if use_color {
+                prefix.push_str(&format!("\x1b[32m{}\x1b[0m", line_num + 1));
+            } else {
+                prefix.push_str(&(line_num + 1).to_string());
+            }
             prefix.push(sep);
         }
-    }
 
-    // バイトオフセット
-    if opts.byte_offset {
-        if use_color {
-            prefix.push_str(&format!("\x1b[32m{}\x1b[0m", byte_off));
-        } else {
-            prefix.push_str(&byte_off.to_string());
+        // バイトオフセット
+        if opts.byte_offset {
+            if use_color {
+                prefix.push_str(&format!("\x1b[32m{}\x1b[0m", byte_off));
+            } else {
+                prefix.push_str(&byte_off.to_string());
+            }
+            prefix.push(sep);
         }
-        prefix.push(sep);
-    }
 
-    // 行番号
-    if opts.line_number {
-        if use_color {
-            prefix.push_str(&format!("\x1b[32m{}\x1b[0m", line_num + 1));
-        } else {
-            prefix.push_str(&(line_num + 1).to_string());
+        // TAB位置揃え
+        if opts.initial_tab && (opts.byte_offset || opts.line_number || filename.is_some()) {
+            prefix.push('\t');
         }
-        prefix.push(sep);
-    }
 
-    // TAB位置揃え
-    if opts.initial_tab && (opts.byte_offset || opts.line_number || filename.is_some()) {
-        prefix.push('\t');
-    }
+        prefix
+    };
 
     // 行内容
     if opts.only_matching && is_match {
-        // -o: マッチ部分のみ
+        // -o: マッチ部分のみ（-b はマッチ位置のオフセット）
         for mat in regex.find_iter(line) {
+            let prefix = build_prefix(byte_off + mat.start());
             let matched = mat.as_str();
             if use_color {
-                println!("{}\x1b[1;31m{}\x1b[0m", prefix, matched);
+                print!("{}\x1b[1;31m{}\x1b[0m{}", prefix, matched, eol);
             } else {
-                println!("{}{}", prefix, matched);
+                print!("{}{}{}", prefix, matched, eol);
             }
         }
     } else if use_color && is_match {
         // 色付き出力
+        let prefix = build_prefix(byte_off);
         let colored = regex.replace_all(line, "\x1b[1;31m$0\x1b[0m");
-        println!("{}{}", prefix, colored);
+        print!("{}{}{}", prefix, colored, eol);
     } else {
-        println!("{}{}", prefix, line);
+        let prefix = build_prefix(byte_off);
+        print!("{}{}{}", prefix, line, eol);
     }
 }
 
@@ -1416,6 +1617,99 @@ mod tests {
         assert!(glob_match_path("src/*.rs", "main.rs", &normalized_path));
         assert!(!glob_match_path("src/*.txt", "main.rs", &normalized_path));
     }
+
+    #[test]
+    fn test_bre_is_default_syntax() {
+        // デフォルト（BRE）では + ? | ( ) { } はリテラル
+        let opts = Options::default();
+        let pat = process_pattern("a+b?c|d(e){f}", &opts);
+        let re = Regex::new(&pat).unwrap();
+        assert!(re.is_match("a+b?c|d(e){f}"));
+        assert!(!re.is_match("aab"));
+
+        // \+ \| などはメタ文字に昇格
+        let pat = process_pattern(r"a\+", &opts);
+        let re = Regex::new(&pat).unwrap();
+        assert!(re.is_match("aaa"));
+    }
+
+    #[test]
+    fn test_bre_word_boundary_extension() {
+        let opts = Options::default();
+        let pat = process_pattern(r"\<word\>", &opts);
+        let re = Regex::new(&pat).unwrap();
+        assert!(re.is_match("a word here"));
+        assert!(!re.is_match("sword"));
+    }
+
+    #[test]
+    fn test_ere_syntax_with_extended_flag() {
+        let opts = Options {
+            extended_regexp: true,
+            ..Default::default()
+        };
+        let pat = process_pattern("a+(b|c)", &opts);
+        let re = Regex::new(&pat).unwrap();
+        assert!(re.is_match("aab"));
+        assert!(re.is_match("ac"));
+    }
+
+    #[test]
+    fn test_convert_bre_escaped_backslash() {
+        // \\ はリテラルのバックスラッシュのまま（後続の ( を誤って昇格しない）
+        assert_eq!(convert_bre_to_ere(r"a\\(b"), r"a\\\(b");
+    }
+
+    #[test]
+    fn test_split_lines_strips_crlf_and_tracks_offsets() {
+        let content = "abc\r\ndef\nghi";
+        let (lines, offsets) = split_lines(content, false);
+        assert_eq!(lines, vec!["abc", "def", "ghi"]);
+        assert_eq!(offsets, vec![0, 5, 9]);
+    }
+
+    #[test]
+    fn test_split_lines_null_data() {
+        let content = "abc\0def\0";
+        let (lines, offsets) = split_lines(content, true);
+        assert_eq!(lines, vec!["abc", "def"]);
+        assert_eq!(offsets, vec![0, 4]);
+    }
+
+    #[test]
+    fn test_parse_args_s_is_not_quiet() {
+        let args: Vec<String> = ["grep", "-s", "pat"].iter().map(|s| s.to_string()).collect();
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.no_messages);
+        assert!(!opts.quiet);
+    }
+
+    #[test]
+    fn test_parse_args_directories_skip() {
+        let args: Vec<String> = ["grep", "-d", "skip", "pat"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.directories, DirAction::Skip);
+
+        let args: Vec<String> = ["grep", "--directories=recurse", "pat"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.recursive);
+    }
+
+    #[test]
+    fn test_patterns_split_on_newline() {
+        let opts = Options {
+            patterns: vec!["foo\nbar".to_string()],
+            ..Default::default()
+        };
+        let patterns = collect_patterns(&opts);
+        assert_eq!(patterns, vec!["foo".to_string(), "bar".to_string()]);
+    }
 }
 
 /// ヘルプを表示
@@ -1438,6 +1732,7 @@ UTF-8, Shift_JIS, EUC-JP を自動判定します。
   -e, --regexp=パターン  検索パターンを指定（複数指定可）
   -f, --file=ファイル    パターンをファイルから読み込み
   -i, --ignore-case      大文字小文字を区別しない
+      --no-ignore-case   大文字小文字を区別する（デフォルト）
   -w, --word-regexp      単語全体としてマッチ
   -x, --line-regexp      行全体としてマッチ
 
@@ -1448,7 +1743,7 @@ UTF-8, Shift_JIS, EUC-JP を自動判定します。
   -m, --max-count=NUM    NUM回マッチしたら終了
   -o, --only-matching    マッチした部分のみ表示
   -q, --quiet, --silent  何も出力しない（終了コードのみ）
-  -s                     エラーメッセージを抑制
+  -s, --no-messages      ファイルのエラーメッセージを抑制
 
 出力行の接頭辞制御:
   -b, --byte-offset      各行のバイトオフセットを表示
@@ -1463,25 +1758,33 @@ UTF-8, Shift_JIS, EUC-JP を自動判定します。
   -B, --before-context=NUM    マッチ前のNUM行を表示
   -C, --context=NUM           前後のNUM行を表示
   -NUM                        -C NUM と同じ
+      --group-separator=SEP   コンテキストのグループ区切り（デフォルト: --）
+      --no-group-separator    グループ区切りを出力しない
 
 ファイルとディレクトリの選択:
-  -r, --recursive        ディレクトリを再帰的に検索
-  -R, --dereference-recursive  シンボリックリンクをたどる
+  -r, --recursive        ディレクトリを再帰的に検索（ファイル省略時は .）
+                         走査中のシンボリックリンクは辿らない
+  -R, --dereference-recursive  再帰検索でシンボリックリンクをたどる
+  -d, --directories=ACTION  ディレクトリの扱い (read, skip, recurse)
+  -D, --devices=ACTION      デバイスファイルの扱い (read, skip)
       --include=GLOB     GLOBにマッチするファイルのみ検索
       --exclude=GLOB     GLOBにマッチするファイルを除外
+      --exclude-from=FILE FILEから除外パターンを読み込み
       --exclude-dir=GLOB GLOBにマッチするディレクトリを除外
 
 その他:
   -v, --invert-match     マッチしない行を表示
   -a, --text             バイナリファイルをテキストとして扱う
+  -I                     バイナリファイルをスキップ（--binary-files=without-match）
       --binary-files=TYPE  バイナリファイルの扱い
                            TYPE: binary, text, without-match
       --color[=WHEN]     マッチ部分を色付け
                            WHEN: auto, always, never
       --label=LABEL      標準入力のラベル
-  -z, --null-data        行区切りをNULLバイトとする
+  -z, --null-data        行区切りをNULLバイトとする（出力もNUL終端）
+      --line-buffered, -U, -u, --mmap  互換のため受理（無視）
       --help             このヘルプを表示
-      --version          バージョン情報を表示
+  -V, --version          バージョン情報を表示
 
 終了コード:
   0  マッチが見つかった
