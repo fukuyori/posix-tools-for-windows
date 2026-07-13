@@ -2,11 +2,45 @@
 // POSIX.1-2017準拠 + GNU拡張
 
 use std::env;
-use std::fs;
-use std::io::{self, Write};
+use std::fs::{self, Metadata};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Component, Path};
 
 use glob;
+
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+
+#[cfg(windows)]
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+
+#[cfg(windows)]
+type Handle = *mut std::ffi::c_void;
+
+#[cfg(windows)]
+#[repr(C)]
+struct ByHandleFileInformation {
+    file_attributes: u32,
+    creation_time: u64,
+    last_access_time: u64,
+    last_write_time: u64,
+    volume_serial_number: u32,
+    file_size_high: u32,
+    file_size_low: u32,
+    number_of_links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+}
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn GetFileInformationByHandle(
+        h_file: Handle,
+        file_information: *mut ByHandleFileInformation,
+    ) -> i32;
+}
 
 #[derive(Default, Clone)]
 struct Options {
@@ -35,7 +69,7 @@ fn main() {
         Err(e) => {
             eprintln!("rm: {}", e);
             eprintln!("詳しくは 'rm --help' を実行してください。");
-            std::process::exit(2);
+            std::process::exit(1);
         }
     };
 
@@ -45,7 +79,7 @@ fn main() {
     }
 
     if opts.show_version {
-        println!("rm (Rust Windows版) 1.0.0");
+        println!("rm (Rust Windows版) 1.1.0");
         println!("POSIX.1-2017準拠 + GNU拡張");
         std::process::exit(0);
     }
@@ -87,10 +121,10 @@ fn main() {
 
     for target in &targets {
         if let Err(e) = remove_path(target, &opts, &mut exit_code) {
-            if !opts.force {
-                eprintln!("rm: '{}' を削除できません: {}", target, format_error(&e));
-                exit_code = 1;
-            }
+            // -f が無視するのは「存在しない」エラーのみ（remove_path 内で処理済み）
+            // 実在するのに削除できないエラーは -f でも報告する（GNU準拠）
+            eprintln!("rm: '{}' を削除できません: {}", target, format_error(&e));
+            exit_code = 1;
         }
     }
 
@@ -132,7 +166,7 @@ fn parse_args(args: &[String]) -> Result<(Options, Vec<String>), String> {
             "--verbose" => opts.verbose = true,
             "--dir" => opts.dir = true,
             "--one-file-system" => opts.one_file_system = true,
-            "--preserve-root" => {
+            "--preserve-root" | "--preserve-root=all" => {
                 opts.preserve_root = true;
                 opts.no_preserve_root = false;
             }
@@ -281,8 +315,7 @@ GNU拡張オプション:
 
 終了ステータス:
   0  正常終了
-  1  削除エラー
-  2  オプションエラー
+  1  エラー発生（削除エラー・オプションエラー）
 
 注意:
   -r を付けずにディレクトリを削除しようとするとエラーになります。
@@ -330,10 +363,37 @@ fn remove_path(target: &str, opts: &Options, exit_code: &mut i32) -> io::Result<
         }
     };
 
+    // シンボリックリンク・ジャンクションはリンク自体を削除（実体はたどらない）
     if metadata.is_dir() && !metadata.file_type().is_symlink() {
         remove_directory(path, opts, exit_code)
     } else {
-        remove_file(path, opts)
+        remove_file(path, &metadata, opts)
+    }
+}
+
+/// ディレクトリ属性を持つリンク（ディレクトリシンボリックリンク・ジャンクション）か
+/// Windowsではこれらの削除に remove_dir が必要
+#[cfg(windows)]
+fn is_dir_link(metadata: &Metadata) -> bool {
+    metadata.file_type().is_symlink()
+        && metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0
+}
+
+#[cfg(not(windows))]
+fn is_dir_link(_metadata: &Metadata) -> bool {
+    false
+}
+
+/// ファイル・シンボリックリンク・ジャンクションを削除する
+fn delete_entry(path: &Path, metadata: &Metadata) -> io::Result<()> {
+    // リンクの readonly 解除は実体側に作用してしまうため行わない
+    if !metadata.file_type().is_symlink() {
+        let _ = remove_readonly(path);
+    }
+    if is_dir_link(metadata) {
+        fs::remove_dir(path)
+    } else {
+        fs::remove_file(path)
     }
 }
 
@@ -344,35 +404,38 @@ fn is_dot_or_dotdot(path: &Path) -> bool {
     )
 }
 
-fn remove_file(path: &Path, opts: &Options) -> io::Result<()> {
-    if opts.interactive && !opts.force {
-        let prompt = if path
-            .metadata()
-            .map(|m| m.permissions().readonly())
-            .unwrap_or(false)
-        {
-            format!(
+fn remove_file(path: &Path, metadata: &Metadata, opts: &Options) -> io::Result<()> {
+    let write_protected =
+        !metadata.file_type().is_symlink() && metadata.permissions().readonly();
+
+    if !opts.force {
+        if opts.interactive {
+            let prompt = if write_protected {
+                format!(
+                    "書き込み保護されたファイル '{}' を削除しますか?",
+                    path.display()
+                )
+            } else {
+                format!("'{}' を削除しますか?", path.display())
+            };
+            if !confirm(&prompt)? {
+                return Ok(());
+            }
+        } else if write_protected && io::stdin().is_terminal() {
+            // POSIX: 書き込み保護されたファイルは -f なしなら端末で確認する
+            if !confirm(&format!(
                 "書き込み保護されたファイル '{}' を削除しますか?",
                 path.display()
-            )
-        } else {
-            format!("'{}' を削除しますか?", path.display())
-        };
-        if !confirm(&prompt)? {
-            return Ok(());
+            ))? {
+                return Ok(());
+            }
         }
     }
 
-    if let Err(e) = remove_readonly(path) {
-        if !opts.force {
-            return Err(e);
-        }
-    }
-
-    fs::remove_file(path)?;
+    delete_entry(path, metadata)?;
 
     if opts.verbose {
-        eprintln!("'{}' を削除しました", path.display());
+        println!("'{}' を削除しました", path.display());
     }
 
     Ok(())
@@ -399,7 +462,7 @@ fn remove_directory(path: &Path, opts: &Options, exit_code: &mut i32) -> io::Res
         fs::remove_dir(path)?;
 
         if opts.verbose {
-            eprintln!("'{}' を削除しました", path.display());
+            println!("ディレクトリ '{}' を削除しました", path.display());
         }
         return Ok(());
     }
@@ -410,10 +473,62 @@ fn remove_directory(path: &Path, opts: &Options, exit_code: &mut i32) -> io::Res
         }
     }
 
-    remove_dir_recursive(path, opts, exit_code)
+    // --one-file-system: 起点のボリュームIDを記録
+    let root_device = if opts.one_file_system {
+        device_id(path).ok()
+    } else {
+        None
+    };
+
+    remove_dir_recursive(path, opts, root_device, exit_code)
 }
 
-fn remove_dir_recursive(path: &Path, opts: &Options, exit_code: &mut i32) -> io::Result<()> {
+/// パスが属するボリューム（ファイルシステム）の識別子を取得
+#[cfg(windows)]
+fn device_id(path: &Path) -> io::Result<u64> {
+    let file = fs::File::open(path)?;
+    let mut info = ByHandleFileInformation {
+        file_attributes: 0,
+        creation_time: 0,
+        last_access_time: 0,
+        last_write_time: 0,
+        volume_serial_number: 0,
+        file_size_high: 0,
+        file_size_low: 0,
+        number_of_links: 0,
+        file_index_high: 0,
+        file_index_low: 0,
+    };
+
+    // SAFETY: `file` is an open handle for the duration of this call and `info`
+    // points to writable memory with the Win32 layout expected by the API.
+    let result =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle() as Handle, &mut info as *mut _) };
+
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(info.volume_serial_number as u64)
+}
+
+#[cfg(unix)]
+fn device_id(path: &Path) -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(fs::metadata(path)?.dev())
+}
+
+#[cfg(not(any(windows, unix)))]
+fn device_id(_path: &Path) -> io::Result<u64> {
+    Ok(0)
+}
+
+fn remove_dir_recursive(
+    path: &Path,
+    opts: &Options,
+    root_device: Option<u64>,
+    exit_code: &mut i32,
+) -> io::Result<()> {
     let entries = fs::read_dir(path)?;
     let mut had_error = false;
 
@@ -421,14 +536,12 @@ fn remove_dir_recursive(path: &Path, opts: &Options, exit_code: &mut i32) -> io:
         let entry = match entry_result {
             Ok(e) => e,
             Err(e) => {
-                if !opts.force {
-                    eprintln!(
-                        "rm: '{}' 内のエントリを読み取れません: {}",
-                        path.display(),
-                        format_error(&e)
-                    );
-                    *exit_code = 1;
-                }
+                eprintln!(
+                    "rm: '{}' 内のエントリを読み取れません: {}",
+                    path.display(),
+                    format_error(&e)
+                );
+                *exit_code = 1;
                 had_error = true;
                 continue;
             }
@@ -438,61 +551,53 @@ fn remove_dir_recursive(path: &Path, opts: &Options, exit_code: &mut i32) -> io:
         let metadata = match fs::symlink_metadata(&entry_path) {
             Ok(m) => m,
             Err(e) => {
-                if !opts.force {
-                    eprintln!(
-                        "rm: '{}' のメタデータを取得できません: {}",
-                        entry_path.display(),
-                        format_error(&e)
-                    );
-                    *exit_code = 1;
-                }
+                eprintln!(
+                    "rm: '{}' のメタデータを取得できません: {}",
+                    entry_path.display(),
+                    format_error(&e)
+                );
+                *exit_code = 1;
                 had_error = true;
                 continue;
             }
         };
 
         if metadata.is_dir() && !metadata.file_type().is_symlink() {
-            if let Err(e) = remove_dir_recursive(&entry_path, opts, exit_code) {
-                if !opts.force {
-                    eprintln!(
-                        "rm: '{}' を削除できません: {}",
-                        entry_path.display(),
-                        format_error(&e)
-                    );
-                    *exit_code = 1;
+            // --one-file-system: 異なるファイルシステムはスキップ
+            if let Some(root) = root_device {
+                match device_id(&entry_path) {
+                    Ok(dev) if dev != root => {
+                        eprintln!(
+                            "rm: 別のファイルシステム上にあるため '{}' をスキップします",
+                            entry_path.display()
+                        );
+                        *exit_code = 1;
+                        had_error = true;
+                        continue;
+                    }
+                    _ => {}
                 }
+            }
+
+            if let Err(e) = remove_dir_recursive(&entry_path, opts, root_device, exit_code) {
+                eprintln!(
+                    "rm: '{}' を削除できません: {}",
+                    entry_path.display(),
+                    format_error(&e)
+                );
+                *exit_code = 1;
                 had_error = true;
             }
         } else {
-            if opts.interactive && !opts.force {
-                match confirm(&format!("'{}' を削除しますか?", entry_path.display())) {
-                    Ok(true) => {}
-                    Ok(false) => continue,
-                    Err(e) => {
-                        eprintln!("rm: 確認エラー: {}", e);
-                        *exit_code = 1;
-                        continue;
-                    }
-                }
-            }
-
-            let _ = remove_readonly(&entry_path);
-
-            if let Err(e) = fs::remove_file(&entry_path) {
-                if !opts.force {
-                    eprintln!(
-                        "rm: '{}' を削除できません: {}",
-                        entry_path.display(),
-                        format_error(&e)
-                    );
-                    *exit_code = 1;
-                }
+            if let Err(e) = remove_file(&entry_path, &metadata, opts) {
+                eprintln!(
+                    "rm: '{}' を削除できません: {}",
+                    entry_path.display(),
+                    format_error(&e)
+                );
+                *exit_code = 1;
                 had_error = true;
                 continue;
-            }
-
-            if opts.verbose {
-                eprintln!("'{}' を削除しました", entry_path.display());
             }
         }
     }
@@ -509,20 +614,19 @@ fn remove_dir_recursive(path: &Path, opts: &Options, exit_code: &mut i32) -> io:
     match fs::remove_dir(path) {
         Ok(()) => {
             if opts.verbose {
-                eprintln!("'{}' を削除しました", path.display());
+                println!("ディレクトリ '{}' を削除しました", path.display());
             }
             Ok(())
         }
         Err(e) => {
             if had_error {
-                if !opts.force {
-                    eprintln!(
-                        "rm: '{}' を削除できません: {}",
-                        path.display(),
-                        format_error(&e)
-                    );
-                    *exit_code = 1;
-                }
+                // 中身のエラーは報告済みなので、二重報告を避ける
+                eprintln!(
+                    "rm: '{}' を削除できません: {}",
+                    path.display(),
+                    format_error(&e)
+                );
+                *exit_code = 1;
                 Ok(())
             } else {
                 Err(e)
@@ -577,6 +681,10 @@ fn confirm(message: &str) -> io::Result<bool> {
 }
 
 fn format_error(e: &io::Error) -> String {
+    // 自前で組み立てたエラーはメッセージをそのまま使う
+    if e.get_ref().is_some() {
+        return e.to_string();
+    }
     match e.kind() {
         io::ErrorKind::NotFound => "そのようなファイルやディレクトリはありません".to_string(),
         io::ErrorKind::PermissionDenied => "許可がありません".to_string(),
