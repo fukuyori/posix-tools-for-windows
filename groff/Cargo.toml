@@ -1,6 +1,6 @@
 [package]
 name = "groff"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 authors = ["fukuyori"]
 description = "軽量groff/nroff実装（manページ表示用）"

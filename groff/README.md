@@ -1,183 +1,107 @@
-# groff - 軽量groff/nroff実装（Rust）
+# groff - groff/nroff 実装（Rust）
 
-Windows環境向けの軽量`groff`/`nroff`実装です。manページの表示に特化しています。
+Windows 環境向けの `groff`/`nroff` 実装です。roff 言語のコア（レジスタ・文字列・
+マクロ定義・条件・数値式・エスケープ）と man マクロパッケージを実装しており、
+man ページのレンダリングで GNU groff と同一の出力を目指しています。
 
-## 注意
+## 互換性の実測
 
-**この実装は完全なgroff互換ではありません。**
+GNU groff 1.23.0（`groff -man -Tutf8`）と Ubuntu の実際の man ページで
+出力を比較検証しています:
 
-GNU groffは非常に複雑なテキスト整形システムで、完全な実装には数万行のコードが必要です。
-この実装は、manページの表示に必要な基本的な機能のみをサポートする軽量版です。
+- **246 ページ中 214 ページ（87%）がバイト単位で完全一致**
+  （coreutils 全般、grep、tar、find、man-db、pod2man 生成ページ、
+  docbook 生成ページなど）
+- 残りは bash / curl / dash など、独自マクロを多用する巨大ページや
+  tbl / eqn（プリプロセッサ）を必要とするページ
 
-## 特徴
+## 実装している機能
 
-- **manページ表示に最適化**: 基本的なmanマクロをサポート
-- **日本語対応**: UTF-8によるマルチバイト文字のサポート
-- **複数出力形式**: ASCII、UTF-8、HTML
-- **ANSIカラー**: ボールド、イタリック（アンダーライン）の表示
-- **高速**: Rustによる効率的な実装
-- **クロスプラットフォーム**: Windows/Linux/macOSで動作
-- **POSIX準拠のglob展開**: ワイルドカードによるファイル指定をサポート
+### roff 言語コア
 
-## インストール
+- レジスタ（`.nr`、`\n`、自動増分、組み込みレジスタ）
+- 文字列（`.ds` / `.as`、`\*`、再帰展開）
+- マクロ定義（`.de` / `.am`、`\$1`〜`\$9`、`\$*`、`.shift`、`.return`）
+- 条件（`.if` / `.ie` / `.el`、`\{ ... \}` ブロック、n/t/d/r/文字列比較/数値式）
+- 数値式（優先順位なし左結合、単位 u n m v i c p P、`\w'...'`）
+- `.so`（相対パス解決付き）、`.ig`、`.rm` / `.rn` / `.als`、`.nop`、`.do`
+- 行末 `\` による行継続、`#n` 等の roff の細部
 
-### Windows
+### 整形エンジン
+
+- 両端揃え（GNU と同じ余白配分・行ごとの交互方向）
+- **Knuth-Liang ハイフネーション**（groff 同梱の hyphen.en / hyphenex.en
+  パターンを使用。明示ハイフン・`\%`・`\-`・`.hy`/`.nh` の区別を含めて
+  GNU の挙動に一致）
+- 文末二重スペース（`\&` / `\|` による打ち消しも GNU 準拠）
+- インデント・一時インデント・センタリング（`.ce`）・行長（`.ll`）
+- タブストップ（`.ta`、デフォルト 0.5i）
+- `\f` フォント切替（SGR 出力: 太字 = `\e[1m`、イタリック = `\e[4m`）
+- 特殊文字 `\(xx` / `\[xxx]`（`\[uXXXX]` ユニコード指定を含む）
+
+### man マクロ
+
+`.TH`（3 分割ヘッダ/フッタ、セクション名デフォルト）、`.SH` / `.SS`、
+`.PP` / `.P` / `.LP`、`.IP` / `.TP` / `.TQ` / `.HP`（ぶら下げタグ、
+長いタグの折り返し）、`.PD`、`.RS` / `.RE`、
+`.B` / `.I` / `.BR` / `.RB` / `.IR` / `.RI` / `.BI` / `.IB` / `.SM` / `.SB`
+（交互フォントの密着連結、引用符内スペースの扱いを含む）、
+`.EX` / `.EE`、`.UR` / `.UE`、`.MT` / `.ME`、`.SY` / `.YS`、`.OP`、`.DT`
+
+見出し直後の空行抑制（no-space モード）や `.IP`/`.TP` による調整モードの
+リセットなど、GNU an.tmac の細かい挙動も再現しています。
+
+## 使い方
+
+```powershell
+groff -man -Tutf8 ls.1              # man ページを表示
+groff -man ls.1 | less -R           # ページャで表示
+groff -man -rLL=100n wide.1         # 行長 100 桁
+groff -man -c plain.1               # SGR 装飾なし
+nroff -man ls.1                     # nroff として呼び出し
+```
+
+## オプション
+
+- `-T DEVICE` — utf8（デフォルト）/ ascii / latin1 / html
+- `-m NAME` — マクロパッケージ（man は組み込み）
+- `-r REG=EXPR` / `-d STR=VAL` — レジスタ / 文字列の事前定義
+- `-c` — SGR エスケープを無効化（環境変数 GROFF_NO_SGR も有効）
+- `-a` — テキスト近似出力
+- `-z` — 整形のみ（出力抑制）
+- `-k -t -e -p -s -R -C -w -W` など — 互換のため受理
+
+## ビルド
+
 ```powershell
 cargo build --release
-# 実行ファイルをPATHの通った場所にコピー
-copy target\release\groff.exe $env:USERPROFILE\bin\
-# nroffとしても使用する場合
-copy target\release\groff.exe $env:USERPROFILE\bin\nroff.exe
 ```
 
-### Linux/macOS
-```bash
-cargo build --release
-cp target/release/groff ~/.local/bin/
-# nroffとしても使用する場合はシンボリックリンクまたはコピー
-cp target/release/groff ~/.local/bin/nroff
+生成物は `target/release/groff.exe` です。`nroff.exe` という名前でコピー
+すると nroff として動作します。
+
+## 既知の制限
+
+- tbl / eqn / pic などのプリプロセッサは未実装（`.TS` テーブル等は崩れます）
+- mdoc マクロパッケージ（BSD 系 man ページ）は未対応
+- 縦方向の高度な機能（トラップ、diversion、ページネーション）は省略
+  （man 表示では連続レンダリングが標準のため実用上の影響はほぼありません）
+
+## ハイフネーションパターンのライセンス
+
+`src/hyphen_en.txt` / `src/hyphenex_en.txt` は groff 1.23.0 に同梱される
+米語ハイフネーションパターン（Gerard D.C. Kuiken 氏および TeX Users Group
+による）で、各ファイル内の著作権表示のとおり自由に複製・再配布できます。
+
+## テスト
+
+```powershell
+cargo test
 ```
 
-## 使用法
-
-```
-groff [オプション]... [ファイル]...
-nroff [オプション]... [ファイル]...
-```
-
-### オプション
-
-| オプション | 説明 |
-|-----------|------|
-| `-T DEVICE` | 出力デバイス（ascii, utf8, html） |
-| `-m NAME` | マクロパッケージ（man, mandoc） |
-| `-C` | 互換モード |
-
-### 出力デバイス
-
-| デバイス | 説明 |
-|---------|------|
-| `ascii` | ASCII端末出力 |
-| `utf8` | UTF-8端末出力（デフォルト） |
-| `html` | HTML出力 |
-
-## サポートするマクロ
-
-### manマクロ
-
-| マクロ | 説明 |
-|-------|------|
-| `.TH` | タイトルヘッダ |
-| `.SH` | セクションヘッダ |
-| `.SS` | サブセクション |
-| `.PP`, `.P`, `.LP` | パラグラフ |
-| `.IP` | インデントパラグラフ |
-| `.TP` | タグ付きパラグラフ |
-| `.RS`, `.RE` | 相対インデント |
-| `.B` | ボールドテキスト |
-| `.I` | イタリックテキスト |
-| `.BR`, `.RB`, `.BI`, `.IB`, `.IR`, `.RI` | フォント交互 |
-| `.SM`, `.SB` | 小さいテキスト |
-| `.EX`, `.EE` | 例（固定幅） |
-| `.nf`, `.fi` | 埋めモード制御 |
-
-### roffリクエスト
-
-| リクエスト | 説明 |
-|-----------|------|
-| `.br` | 改行 |
-| `.sp` | 空白行 |
-| `.ds` | 文字列定義 |
-| `.nr` | 数値レジスタ |
-| `.if`, `.ie`, `.el` | 条件処理 |
-
-### 特殊文字
-
-多くのroff特殊文字をサポート:
-- `\(em` → — (em dash)
-- `\(en` → – (en dash)
-- `\(bu` → • (bullet)
-- `\(lq`, `\(rq` → ", " (引用符)
-- その他多数
-
-## 使用例
-
-### manページの表示
-```bash
-# UTF-8端末で表示
-groff -man -Tutf8 ls.1
-
-# ASCII出力
-groff -man -Tascii ls.1
-
-# HTML出力
-groff -man -Thtml ls.1 > ls.html
-```
-
-### glob展開による複数ファイル処理
-```bash
-# すべてのmanページを処理
-groff -man *.1
-
-# 特定のディレクトリのファイルを処理
-groff -man man1/*.1
-```
+パーサー・エスケープ・タグ配置・両端揃え・分綴・条件・マクロ展開など
+28 件のユニットテストがあります。
 
 ## ライセンス
 
 MIT
-
-## 貢献
-
-バグ報告や機能リクエストはGitHubのIssueでお願いします。
-
-## 作者
-
-fukuyori
-
-# nroffとして使用
-nroff -man ls.1
-```
-
-### HTML出力
-```bash
-groff -man -Thtml ls.1 > ls.html
-```
-
-### 標準入力から
-```bash
-cat document.1 | groff -man
-```
-
-### 複数ファイル
-```bash
-groff -man *.1
-```
-
-## 制限事項
-
-以下の機能はサポートしていません：
-
-- PostScript/PDF出力
-- tbl（表）プリプロセッサ
-- eqn（数式）プリプロセッサ
-- pic（図）プリプロセッサ
-- 複雑なマクロ定義
-- 完全なtroff互換性
-- ページ区切り制御
-
-manページ以外の複雑なroff文書の処理には、GNU groffをお使いください。
-
-## ライセンス
-
-MIT
-
-## 関連
-
-このツールは、Windows環境でUnix系コマンドを使いやすくするプロジェクトの一部です。
-`man`コマンドと組み合わせて使用することを想定しています。
-
-```bash
-# manコマンドからの呼び出し例
-man -P "groff -man -Tutf8" ls
-```
