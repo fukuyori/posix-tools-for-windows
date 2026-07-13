@@ -5,10 +5,18 @@ Rustで実装されたPOSIX準拠の`mv`コマンドです。Windows上でもLin
 ## 機能
 
 - ファイルおよびディレクトリの移動と名前変更
-- 内部glob展開（case-sensitive、大文字小文字を区別）
+- 内部glob展開（大文字小文字を区別しない。`-t` 指定時は全ソース引数を展開）
 - POSIX標準オプションのサポート（`-f`, `-i`）
 - GNU拡張オプションのサポート（`-n`, `-u`, `-v`, `-b`, `--backup`, `-S`, `-t`, `-T`, `--strip-trailing-slashes`）
-- Windows固有の対応（読み取り専用ファイルの扱い、異なるドライブ間の移動）
+- `SIMPLE_BACKUP_SUFFIX` / `VERSION_CONTROL` 環境変数のサポート
+- GNU準拠の安全性チェック
+  - 非空ディレクトリは上書きしない（エラー）
+  - ディレクトリと非ディレクトリの相互上書きを拒否
+  - 自分自身のサブディレクトリへの移動を検出してエラー
+- Windows固有の対応
+  - 読み取り専用ファイルの上書き・移動
+  - 異なるドライブ間の移動（コピー＆削除、タイムスタンプ保持）
+  - 大文字小文字のみのリネーム（`mv file.txt FILE.TXT`）
 - 日本語のエラーメッセージ
 
 ## インストール
@@ -45,7 +53,7 @@ mv [オプション]... -t ディレクトリ ソース...
   - `numbered`, `t`: 番号付きバックアップを作成
   - `existing`, `nil`: 番号付きバックアップがあれば番号付き、なければ単純
   - `simple`, `never`: 常に単純バックアップを作成
-- `-S`, `--suffix=SUFFIX`: バックアップサフィックスを指定
+- `-S`, `--suffix=SUFFIX`: バックアップサフィックスを指定（デフォルトは `~`、`SIMPLE_BACKUP_SUFFIX` 環境変数でも変更可能）
 - `-t`, `--target-directory=DIRECTORY`: すべてのソース引数を DIRECTORY に移動
 - `-T`, `--no-target-directory`: 移動先を通常のファイルとして扱う
 - `--strip-trailing-slashes`: ソース引数から末尾のスラッシュを削除
@@ -82,11 +90,20 @@ mv -b file.txt existing.txt
 
 # 更新チェック
 mv -u source.txt dest.txt
+
+# 大文字小文字のみのリネーム（Windows）
+mv readme.txt README.TXT
+```
+
+## テスト
+
+```bash
+cargo test
 ```
 
 ## ビルド要件
 
-- Rust 1.70以上
+- Rust 1.85以上（edition 2024）
 - Cargo
 
 ## ライセンス
@@ -99,5 +116,4 @@ MIT
 
 ## 作者
 
-Rustコミュニティ</content>
-<parameter name="filePath">d:\home\source\rust\tools\mv\README.md
+Rustコミュニティ

@@ -47,7 +47,7 @@ fn main() {
         Err(e) => {
             eprintln!("mv: {}", e);
             eprintln!("詳細は 'mv --help' を参照してください");
-            std::process::exit(2);
+            std::process::exit(1);
         }
     };
     
@@ -57,12 +57,12 @@ fn main() {
     }
     
     if opts.show_version {
-        println!("mv 1.0.0 (Rust Windows版 - POSIX準拠)");
+        println!("mv 1.1.0 (Rust Windows版 - POSIX準拠)");
         std::process::exit(0);
     }
     
-    // glob展開（最後の引数は移動先なので展開しない）
-    let targets = expand_globs_for_mv(targets);
+    // glob展開（-t 指定時は全引数がソース、それ以外は最後の引数が移動先なので展開しない）
+    let targets = expand_globs_for_mv(targets, opts.target_dir.is_some());
     
     if let Err(e) = run(&opts, &targets) {
         eprintln!("mv: {}", e);
@@ -72,7 +72,7 @@ fn main() {
 
 fn parse_args(args: &[String]) -> Result<(Options, Vec<String>), String> {
     let mut opts = Options {
-        backup_suffix: "~".to_string(),
+        backup_suffix: env::var("SIMPLE_BACKUP_SUFFIX").unwrap_or_else(|_| "~".to_string()),
         ..Default::default()
     };
     let mut targets = Vec::new();
@@ -113,7 +113,11 @@ fn parse_args(args: &[String]) -> Result<(Options, Vec<String>), String> {
     // オプションの優先順位を処理
     // POSIX: 最後に指定されたオプションが有効
     // -f が指定されたら -i, -n を無効化（parse時に処理済み）
-    
+
+    if opts.target_dir.is_some() && opts.no_target_dir {
+        return Err("--target-directory (-t) と --no-target-directory (-T) は同時に指定できません".to_string());
+    }
+
     Ok((opts, targets))
 }
 
@@ -148,14 +152,14 @@ fn parse_long_option(arg: &str, args: &[String], i: &mut usize, opts: &mut Optio
                 Some("existing") | Some("nil") => BackupMode::Existing,
                 Some("none") | Some("off") => BackupMode::None,
                 Some(v) => return Err(format!("'--backup' の引数が不正です: '{}'", v)),
-                None => BackupMode::Existing,
+                None => default_backup_mode(),
             };
         }
         "suffix" => {
             let val = value.ok_or("'--suffix' には引数が必要です")?;
             opts.backup_suffix = val.to_string();
             if opts.backup == BackupMode::None {
-                opts.backup = BackupMode::Simple;
+                opts.backup = default_backup_mode();
             }
         }
         "target-directory" => {
@@ -204,7 +208,7 @@ fn parse_short_options(arg: &str, args: &[String], i: &mut usize, opts: &mut Opt
             'u' => opts.update = true,
             'b' => {
                 if opts.backup == BackupMode::None {
-                    opts.backup = BackupMode::Existing;
+                    opts.backup = default_backup_mode();
                 }
             }
             'T' => opts.no_target_dir = true,
@@ -226,14 +230,14 @@ fn parse_short_options(arg: &str, args: &[String], i: &mut usize, opts: &mut Opt
                 if !rest.is_empty() {
                     opts.backup_suffix = rest;
                     if opts.backup == BackupMode::None {
-                        opts.backup = BackupMode::Simple;
+                        opts.backup = default_backup_mode();
                     }
                     return Ok(());
                 } else if *i + 1 < args.len() {
                     *i += 1;
                     opts.backup_suffix = args[*i].clone();
                     if opts.backup == BackupMode::None {
-                        opts.backup = BackupMode::Simple;
+                        opts.backup = default_backup_mode();
                     }
                     return Ok(());
                 } else {
@@ -249,28 +253,28 @@ fn parse_short_options(arg: &str, args: &[String], i: &mut usize, opts: &mut Opt
 }
 
 /// Windows向けglob展開（mvコマンド用）
-/// 最後の引数は移動先なので展開しない
-fn expand_globs_for_mv(raw_targets: Vec<String>) -> Vec<String> {
-    if raw_targets.len() <= 1 {
+/// 最後の引数は移動先なので展開しない（-t 指定時は全引数がソースなので展開する）
+fn expand_globs_for_mv(raw_targets: Vec<String>, expand_all: bool) -> Vec<String> {
+    if !expand_all && raw_targets.len() <= 1 {
         return raw_targets;
     }
-    
+
     let mut result = Vec::new();
-    let last_idx = raw_targets.len() - 1;
-    
+    let last_idx = raw_targets.len().saturating_sub(1);
+
     let options = glob::MatchOptions {
         case_sensitive: false,
         ..Default::default()
     };
-    
+
     for (idx, pattern) in raw_targets.into_iter().enumerate() {
         // 最後の引数（移動先）は展開しない
-        if idx == last_idx {
+        if !expand_all && idx == last_idx {
             result.push(pattern);
             continue;
         }
-        
-        if pattern.contains('*') || pattern.contains('?') {
+
+        if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
             match glob::glob_with(&pattern, options) {
                 Ok(paths) => {
                     let mut matched = false;
@@ -394,17 +398,26 @@ fn run(opts: &Options, targets: &[String]) -> io::Result<()> {
         2 => {
             let src = strip_slashes(&targets[0], opts);
             let dest = Path::new(&targets[1]);
-            
-            if dest.is_dir() && !opts.no_target_dir {
+
+            // 大文字小文字のみのリネームは move_item で直接処理
+            // （dest.is_dir() が true でも自分自身の中へ移動しない）
+            if dest.is_dir() && !opts.no_target_dir && !is_case_only_rename(&src, dest) {
                 move_to_directory(&src, dest, opts)?;
             } else {
                 move_item(&src, dest, opts)?;
             }
         }
         _ => {
+            if opts.no_target_dir {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("余分なオペランド '{}'", targets[2]),
+                ));
+            }
+
             // 複数ソース -> 最後がディレクトリ
             let dest = Path::new(targets.last().unwrap());
-            
+
             if !dest.is_dir() {
                 return Err(io::Error::new(
                     io::ErrorKind::NotADirectory,
@@ -458,41 +471,88 @@ fn move_item(src: &Path, dest: &Path, opts: &Options) -> io::Result<()> {
     
     // 同一ファイルチェック（正規化して比較）
     let src_canonical = fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
-    let dest_canonical = if dest.exists() {
+    let dest_exists = dest.exists();
+    let dest_canonical = if dest_exists {
         fs::canonicalize(dest).unwrap_or_else(|_| dest.to_path_buf())
     } else {
         dest.to_path_buf()
     };
-    
+
     if src_canonical == dest_canonical {
+        // Windowsの大文字小文字を区別しないFSでは、大文字小文字のみの
+        // リネームも「同じファイル」になる。この場合はリネームを実行する
+        if is_case_only_rename(src, dest) {
+            return match fs::rename(src, dest) {
+                Ok(()) => {
+                    print_verbose(src, dest, None, opts);
+                    Ok(())
+                }
+                Err(e) => Err(io::Error::new(
+                    e.kind(),
+                    format!("'{}' を '{}' に移動できません: {}", src.display(), dest.display(), format_error(&e)),
+                )),
+            };
+        }
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("'{}' と '{}' は同じファイルです", src.display(), dest.display()),
         ));
     }
-    
+
+    // 自分自身のサブディレクトリへの移動チェック
+    if src.is_dir() {
+        let dest_full = dest.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .and_then(|p| fs::canonicalize(p).ok())
+            .map(|p| p.join(dest.file_name().unwrap_or_default()))
+            .unwrap_or_else(|| dest_canonical.clone());
+        if is_within(&src_canonical, &dest_full) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("'{}' を自分自身のサブディレクトリ '{}' に移動できません", src.display(), dest.display()),
+            ));
+        }
+    }
+
     // 移動先が存在する場合の処理
-    if dest.exists() {
+    let mut backup_path: Option<PathBuf> = None;
+    if dest_exists {
         // -n: 上書きしない
         if opts.no_clobber {
             // 静かにスキップ（POSIX準拠）
             return Ok(());
         }
-        
+
         // -u: 更新チェック
         if opts.update {
             if !is_newer(src, dest)? {
                 return Ok(());
             }
         }
-        
+
         // -i: 確認
         if opts.interactive && !opts.force {
             if !confirm(&format!("mv: '{}' を上書きしますか?", dest.display()))? {
                 return Ok(());
             }
         }
-        
+
+        // ディレクトリと非ディレクトリの上書きは不可（GNU準拠）
+        let src_is_dir = src.is_dir();
+        let dest_is_dir = dest.is_dir();
+        if dest_is_dir && !src_is_dir {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("ディレクトリ '{}' を非ディレクトリで上書きできません", dest.display()),
+            ));
+        }
+        if !dest_is_dir && src_is_dir {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("非ディレクトリ '{}' をディレクトリで上書きできません", dest.display()),
+            ));
+        }
+
         // バックアップ
         if opts.backup != BackupMode::None {
             let backup = create_backup_path(dest, opts);
@@ -502,29 +562,26 @@ fn move_item(src: &Path, dest: &Path, opts: &Options) -> io::Result<()> {
                     format!("'{}' のバックアップを作成できません: {}", dest.display(), format_error(&e)),
                 ));
             }
-            if opts.verbose {
-                eprintln!("'{}' -> '{}' (バックアップ)", dest.display(), backup.display());
-            }
-        } else {
-            // 既存を削除（読み取り専用対応）
+            backup_path = Some(backup);
+        } else if dest_is_dir {
+            // 上書きできるのは空ディレクトリのみ（GNU準拠、非空なら失敗）
             remove_readonly(dest)?;
-            if dest.is_dir() {
-                fs::remove_dir_all(dest).map_err(|e| {
-                    io::Error::new(
-                        e.kind(),
-                        format!("'{}' を削除できません: {}", dest.display(), format_error(&e)),
-                    )
-                })?;
-            }
+            fs::remove_dir(dest).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("'{}' を '{}' に移動できません: {}", src.display(), dest.display(), format_error(&e)),
+                )
+            })?;
+        } else {
+            // 既存ファイルは rename で置き換える（読み取り専用属性のみ解除）
+            remove_readonly(dest)?;
         }
     }
-    
+
     // 移動実行
     match fs::rename(src, dest) {
         Ok(()) => {
-            if opts.verbose {
-                eprintln!("'{}' -> '{}'", src.display(), dest.display());
-            }
+            print_verbose(src, dest, backup_path.as_deref(), opts);
             Ok(())
         }
         Err(e) => {
@@ -535,7 +592,7 @@ fn move_item(src: &Path, dest: &Path, opts: &Options) -> io::Result<()> {
             let is_cross_device = e.kind() == io::ErrorKind::CrossesDevices;
             
             if is_cross_device || e.to_string().contains("cross-device") {
-                move_across_drives(src, dest, opts)
+                move_across_drives(src, dest, backup_path.as_deref(), opts)
             } else {
                 Err(io::Error::new(
                     e.kind(),
@@ -546,7 +603,7 @@ fn move_item(src: &Path, dest: &Path, opts: &Options) -> io::Result<()> {
     }
 }
 
-fn move_across_drives(src: &Path, dest: &Path, opts: &Options) -> io::Result<()> {
+fn move_across_drives(src: &Path, dest: &Path, backup: Option<&Path>, opts: &Options) -> io::Result<()> {
     if src.is_dir() {
         copy_dir_recursive(src, dest)?;
         fs::remove_dir_all(src).map_err(|e| {
@@ -562,6 +619,8 @@ fn move_across_drives(src: &Path, dest: &Path, opts: &Options) -> io::Result<()>
                 format!("'{}' を '{}' にコピーできません: {}", src.display(), dest.display(), format_error(&e)),
             )
         })?;
+        preserve_times(src, dest);
+        remove_readonly(src)?;
         fs::remove_file(src).map_err(|e| {
             io::Error::new(
                 e.kind(),
@@ -569,12 +628,74 @@ fn move_across_drives(src: &Path, dest: &Path, opts: &Options) -> io::Result<()>
             )
         })?;
     }
-    
-    if opts.verbose {
-        eprintln!("'{}' -> '{}'", src.display(), dest.display());
-    }
-    
+
+    print_verbose(src, dest, backup, opts);
+
     Ok(())
+}
+
+/// コピー後にタイムスタンプを移行する（ベストエフォート）
+fn preserve_times(src: &Path, dest: &Path) {
+    let Ok(meta) = src.metadata() else { return };
+    let mut times = fs::FileTimes::new();
+    if let Ok(m) = meta.modified() {
+        times = times.set_modified(m);
+    }
+    if let Ok(a) = meta.accessed() {
+        times = times.set_accessed(a);
+    }
+    if let Ok(f) = fs::OpenOptions::new().write(true).open(dest) {
+        let _ = f.set_times(times);
+    }
+}
+
+fn print_verbose(src: &Path, dest: &Path, backup: Option<&Path>, opts: &Options) {
+    if !opts.verbose {
+        return;
+    }
+    match backup {
+        Some(b) => println!("'{}' -> '{}' (バックアップ: '{}')", src.display(), dest.display(), b.display()),
+        None => println!("'{}' -> '{}'", src.display(), dest.display()),
+    }
+}
+
+/// 同一ファイルを指すが、最終要素の大文字小文字だけが異なるか
+/// （Windowsの大文字小文字を区別しないFSでのリネーム用）
+fn is_case_only_rename(src: &Path, dest: &Path) -> bool {
+    if !dest.exists() {
+        return false;
+    }
+    let (Ok(a), Ok(b)) = (fs::canonicalize(src), fs::canonicalize(dest)) else {
+        return false;
+    };
+    if a != b {
+        return false;
+    }
+    match (src.file_name(), dest.file_name()) {
+        (Some(x), Some(y)) => {
+            x != y && x.to_string_lossy().to_lowercase() == y.to_string_lossy().to_lowercase()
+        }
+        _ => false,
+    }
+}
+
+/// path が dir の内部（サブディレクトリ以下）にあるか
+fn is_within(dir: &Path, path: &Path) -> bool {
+    let d = dir.to_string_lossy().to_lowercase();
+    let p = path.to_string_lossy().to_lowercase();
+    p.len() > d.len()
+        && p.starts_with(&d)
+        && matches!(p.as_bytes()[d.len()], b'/' | b'\\')
+}
+
+/// VERSION_CONTROL 環境変数からデフォルトのバックアップモードを決定
+fn default_backup_mode() -> BackupMode {
+    match env::var("VERSION_CONTROL").ok().as_deref() {
+        Some("none") | Some("off") => BackupMode::None,
+        Some("simple") | Some("never") => BackupMode::Simple,
+        Some("numbered") | Some("t") => BackupMode::Numbered,
+        _ => BackupMode::Existing,
+    }
 }
 
 fn copy_dir_recursive(src: &Path, dest: &Path) -> io::Result<()> {
@@ -610,9 +731,12 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> io::Result<()> {
                 had_error = true;
             }
         } else {
-            if let Err(e) = fs::copy(&src_path, &dest_path) {
-                eprintln!("mv: '{}' を '{}' にコピーできません: {}", src_path.display(), dest_path.display(), format_error(&e));
-                had_error = true;
+            match fs::copy(&src_path, &dest_path) {
+                Ok(_) => preserve_times(&src_path, &dest_path),
+                Err(e) => {
+                    eprintln!("mv: '{}' を '{}' にコピーできません: {}", src_path.display(), dest_path.display(), format_error(&e));
+                    had_error = true;
+                }
             }
         }
     }
