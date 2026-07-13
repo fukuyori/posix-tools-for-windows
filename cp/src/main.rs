@@ -1,6 +1,6 @@
 use std::env;
 use std::fs::{self, File, FileTimes, Metadata};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use glob;
@@ -16,18 +16,22 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 /// シンボリックリンクの扱い
 #[derive(Clone, Copy, PartialEq)]
 enum SymlinkMode {
-    /// -P: シンボリックリンクをたどらない（デフォルト）
+    /// -P: シンボリックリンクをたどらない（-R 時のデフォルト）
     NoFollow,
     /// -H: コマンドライン引数のシンボリックリンクのみたどる
     FollowCommandLine,
-    /// -L: すべてのシンボリックリンクをたどる
+    /// -L: すべてのシンボリックリンクをたどる（非 -R 時のデフォルト）
     FollowAll,
 }
 
-impl Default for SymlinkMode {
-    fn default() -> Self {
-        SymlinkMode::NoFollow
-    }
+/// バックアップの種類（GNU準拠）
+#[derive(Default, Clone, Copy, PartialEq)]
+enum BackupMode {
+    #[default]
+    None,
+    Simple,      // 単純バックアップ (~)
+    Numbered,    // 番号付き (.~1~)
+    Existing,    // 既存に合わせる
 }
 
 #[derive(Clone, Copy, Default)]
@@ -80,19 +84,32 @@ struct Options {
     // POSIX オプション
     recursive: bool,          // -R: ディレクトリを再帰的にコピー
     preserve: bool,           // -p: 属性を保持
-    symlink_mode: SymlinkMode, // -H, -L, -P: シンボリックリンクの扱い
+    symlink_mode: Option<SymlinkMode>, // -H, -L, -P: シンボリックリンクの扱い（未指定時は -R なら -P、それ以外は -L）
     overwrite_mode: OverwriteMode, // -f, -i, -n: 上書き制御
-    
+
     // GNU拡張オプション
     archive: bool,            // -a: アーカイブモード (-pPR と同等)
     verbose: bool,            // -v: コピー内容を表示
     update: bool,             // -u: 更新されたファイルのみコピー
-    backup: bool,             // -b: バックアップを作成
+    backup: BackupMode,       // -b, --backup: バックアップを作成
+    backup_suffix: String,    // -S, --suffix: バックアップサフィックス
     target_dir: Option<String>,  // -t: ターゲットディレクトリ
     no_target_dir: bool,      // -T: ターゲットをディレクトリとして扱わない
-    
+
     show_help: bool,
     show_version: bool,
+}
+
+impl Options {
+    /// 有効なシンボリックリンクモードを解決する
+    /// POSIX/GNU: -H/-L/-P 未指定時、-R ありなら -P、なしなら -L 相当
+    fn effective_symlink_mode(&self) -> SymlinkMode {
+        self.symlink_mode.unwrap_or(if self.recursive {
+            SymlinkMode::NoFollow
+        } else {
+            SymlinkMode::FollowAll
+        })
+    }
 }
 
 fn main() {
@@ -111,7 +128,7 @@ fn main() {
     }
     
     if opts.show_version {
-        println!("cp 1.0.0 (Rust実装)");
+        println!("cp 1.1.0 (Rust実装)");
         std::process::exit(0);
     }
     
@@ -126,7 +143,10 @@ fn main() {
 }
 
 fn parse_args(args: &[String]) -> Result<(Options, Vec<String>), String> {
-    let mut opts = Options::default();
+    let mut opts = Options {
+        backup_suffix: env::var("SIMPLE_BACKUP_SUFFIX").unwrap_or_else(|_| "~".to_string()),
+        ..Default::default()
+    };
     let mut targets = Vec::new();
     let mut end_of_opts = false;
     let mut skip_next = false;
@@ -150,16 +170,34 @@ fn parse_args(args: &[String]) -> Result<(Options, Vec<String>), String> {
             "--no-clobber" => opts.overwrite_mode = OverwriteMode::NoClobber,
             "--verbose" => opts.verbose = true,
             "--preserve" => opts.preserve = true,
-            "--archive" => opts.archive = true,
+            "--archive" => {
+                opts.archive = true;
+                opts.symlink_mode = Some(SymlinkMode::NoFollow);
+            }
             "--update" => opts.update = true,
-            "--backup" => opts.backup = true,
+            "--backup" => opts.backup = default_backup_mode(),
             "--no-target-directory" => opts.no_target_dir = true,
-            "--no-dereference" => opts.symlink_mode = SymlinkMode::NoFollow,
-            "--dereference" => opts.symlink_mode = SymlinkMode::FollowAll,
+            "--no-dereference" => opts.symlink_mode = Some(SymlinkMode::NoFollow),
+            "--dereference" => opts.symlink_mode = Some(SymlinkMode::FollowAll),
             "--help" => opts.show_help = true,
             "--version" => opts.show_version = true,
             s if s.starts_with("--target-directory=") => {
                 opts.target_dir = Some(s.trim_start_matches("--target-directory=").to_string());
+            }
+            s if s.starts_with("--backup=") => {
+                opts.backup = match s.trim_start_matches("--backup=") {
+                    "simple" | "never" => BackupMode::Simple,
+                    "numbered" | "t" => BackupMode::Numbered,
+                    "existing" | "nil" => BackupMode::Existing,
+                    "none" | "off" => BackupMode::None,
+                    v => return Err(format!("'--backup' の引数が不正です: '{}'", v)),
+                };
+            }
+            s if s.starts_with("--suffix=") => {
+                opts.backup_suffix = s.trim_start_matches("--suffix=").to_string();
+                if opts.backup == BackupMode::None {
+                    opts.backup = default_backup_mode();
+                }
             }
             s if s.starts_with("--") => {
                 return Err(format!("不明なオプション '{}'", s));
@@ -174,16 +212,41 @@ fn parse_args(args: &[String]) -> Result<(Options, Vec<String>), String> {
                         'f' => opts.overwrite_mode = OverwriteMode::Force,
                         'i' => opts.overwrite_mode = OverwriteMode::Interactive,
                         'p' => opts.preserve = true,
-                        'H' => opts.symlink_mode = SymlinkMode::FollowCommandLine,
-                        'L' => opts.symlink_mode = SymlinkMode::FollowAll,
-                        'P' => opts.symlink_mode = SymlinkMode::NoFollow,
+                        'H' => opts.symlink_mode = Some(SymlinkMode::FollowCommandLine),
+                        'L' => opts.symlink_mode = Some(SymlinkMode::FollowAll),
+                        'P' => opts.symlink_mode = Some(SymlinkMode::NoFollow),
                         // GNU拡張
                         'r' => opts.recursive = true,  // -r は -R と同じ
-                        'a' => opts.archive = true,
+                        'a' => {
+                            opts.archive = true;
+                            opts.symlink_mode = Some(SymlinkMode::NoFollow);
+                        }
+                        'd' => opts.symlink_mode = Some(SymlinkMode::NoFollow),
                         'n' => opts.overwrite_mode = OverwriteMode::NoClobber,
                         'v' => opts.verbose = true,
                         'u' => opts.update = true,
-                        'b' => opts.backup = true,
+                        'b' => {
+                            if opts.backup == BackupMode::None {
+                                opts.backup = default_backup_mode();
+                            }
+                        }
+                        'S' => {
+                            // -S SUFFIX 形式
+                            if j + 1 < chars.len() {
+                                opts.backup_suffix = chars[j + 1..].iter().collect();
+                            } else if let Some(next) = args.get(i + 2) {
+                                opts.backup_suffix = next.clone();
+                                skip_next = true;
+                            } else {
+                                return Err("オプション '-S' には引数が必要です".to_string());
+                            }
+                            if opts.backup == BackupMode::None {
+                                opts.backup = default_backup_mode();
+                            }
+                            if j + 1 < chars.len() {
+                                break;
+                            }
+                        }
                         'T' => opts.no_target_dir = true,
                         't' => {
                             // -t DIR 形式
@@ -206,13 +269,16 @@ fn parse_args(args: &[String]) -> Result<(Options, Vec<String>), String> {
         }
     }
     
-    // -a は -pPR と同等
+    // -a は -pPR と同等（-P は指定時点で設定済み。後続の -L/-H が優先される）
     if opts.archive {
         opts.preserve = true;
         opts.recursive = true;
-        opts.symlink_mode = SymlinkMode::NoFollow;
     }
-    
+
+    if opts.target_dir.is_some() && opts.no_target_dir {
+        return Err("--target-directory (-t) と --no-target-directory (-T) は同時に指定できません".to_string());
+    }
+
     // Windows ではシェルが glob 展開しないため、cp 側でオペランドを展開する。
     // 「最後の引数だけコピー先」とは決め打ちせず、展開後のオペランド列に対して
     // 通常の cp ルールを適用することで POSIX 系シェルの見え方に近づける。
@@ -295,22 +361,33 @@ POSIXオプション:
   -i                  上書き前に確認
   -p                  属性（タイムスタンプ、パーミッション）を保持
   -H                  コマンドライン引数のシンボリックリンクをたどる
-  -L                  すべてのシンボリックリンクをたどる
-  -P                  シンボリックリンクをたどらない（デフォルト）
+  -L                  すべてのシンボリックリンクをたどる（非 -R 時のデフォルト）
+  -P                  シンボリックリンクをたどらない（-R 時のデフォルト）
 
 GNU拡張オプション:
   -a, --archive       アーカイブモード（-pPR と同等）
   -r                  -R と同じ
+  -d                  シンボリックリンクをリンクとしてコピー（-P と同様）
   -n, --no-clobber    既存ファイルを上書きしない
   -u, --update        ソースが新しい場合のみコピー
   -v, --verbose       コピー内容を表示
-  -b, --backup        上書き前にバックアップを作成（.bak）
+  -b                  上書き前にバックアップを作成
+      --backup[=CONTROL]
+                      バックアップ方法を指定
+                        none, off       作成しない
+                        numbered, t     番号付き (.~1~)
+                        existing, nil   番号付きがあれば番号付き、なければ単純
+                        simple, never   常に単純 (~)
+  -S, --suffix=SUFFIX バックアップサフィックスを指定（デフォルト ~、
+                      SIMPLE_BACKUP_SUFFIX 環境変数でも変更可能）
   -t, --target-directory=DIR
                       ターゲットディレクトリを指定
   -T, --no-target-directory
                       ターゲットをディレクトリとして扱わない
       --help          このヘルプを表示
       --version       バージョンを表示
+
+バックアップ方法は --backup または VERSION_CONTROL 環境変数で選択できます。
 
 例:
   cp file.txt backup.txt       ファイルをコピー
@@ -373,9 +450,16 @@ fn run(opts: &Options, targets: &[String], exit_code: &mut i32) -> io::Result<()
             }
         }
         _ => {
+            if opts.no_target_dir {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("余分なオペランド '{}'", targets[2]),
+                ));
+            }
+
             // 複数ソース -> 最後がディレクトリ
             let dest = Path::new(targets.last().unwrap());
-            
+
             if !dest.is_dir() {
                 return Err(io::Error::new(
                     io::ErrorKind::NotADirectory,
@@ -407,7 +491,7 @@ fn copy_to_directory(src: &Path, dest_dir: &Path, opts: &Options, is_command_lin
 
 fn copy_item(src: &Path, dest: &Path, opts: &Options, is_command_line: bool, exit_code: &mut i32) -> io::Result<()> {
     // シンボリックリンクの処理を決定
-    let follow_symlink = match opts.symlink_mode {
+    let follow_symlink = match opts.effective_symlink_mode() {
         SymlinkMode::NoFollow => false,
         SymlinkMode::FollowCommandLine => is_command_line,
         SymlinkMode::FollowAll => true,
@@ -452,8 +536,22 @@ fn copy_item(src: &Path, dest: &Path, opts: &Options, is_command_line: bool, exi
                 format!("'{}': -R を指定しないとディレクトリを省略します", src.display()),
             ));
         }
+        // 非ディレクトリをディレクトリで上書きは不可（GNU準拠）
+        if dest.exists() && !dest.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("非ディレクトリ '{}' をディレクトリ '{}' で上書きできません", dest.display(), src.display()),
+            ));
+        }
         copy_directory(src, dest, opts, exit_code)
     } else {
+        // ディレクトリを非ディレクトリで上書きは不可（GNU準拠）
+        if dest.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("ディレクトリ '{}' を非ディレクトリで上書きできません", dest.display()),
+            ));
+        }
         copy_file(src, dest, &metadata, opts)
     }
 }
@@ -603,7 +701,7 @@ fn prepare_destination_for_overwrite(
         return Ok(DestinationAction::Skip);
     }
 
-    if opts.backup {
+    if opts.backup != BackupMode::None {
         create_backup(dest, opts)?;
         return Ok(DestinationAction::Continue);
     }
@@ -700,7 +798,7 @@ fn copy_file(src: &Path, dest: &Path, src_metadata: &Metadata, opts: &Options) -
         }
         
         // -b: バックアップ
-        if opts.backup {
+        if opts.backup != BackupMode::None {
             create_backup(dest, opts)?;
         }
         
@@ -744,37 +842,32 @@ fn copy_file(src: &Path, dest: &Path, src_metadata: &Metadata, opts: &Options) -
 
 /// ファイル内容をコピー
 fn copy_file_contents(src: &Path, dest: &Path) -> io::Result<u64> {
-    let mut src_file = File::open(src)?;
-    let mut dest_file = File::create(dest)?;
-    
-    let mut buffer = [0u8; 8192];
-    let mut total = 0u64;
-    
-    loop {
-        let bytes_read = src_file.read(&mut buffer)?;
-        if bytes_read == 0 {
-            break;
-        }
-        dest_file.write_all(&buffer[..bytes_read])?;
-        total += bytes_read as u64;
-    }
-    
-    Ok(total)
+    let mut src_file = File::open(src).map_err(|e| {
+        io::Error::new(e.kind(),
+            format!("'{}' を開けません: {}", src.display(), format_error(&e)))
+    })?;
+    let mut dest_file = File::create(dest).map_err(|e| {
+        io::Error::new(e.kind(),
+            format!("通常ファイル '{}' を作成できません: {}", dest.display(), format_error(&e)))
+    })?;
+
+    io::copy(&mut src_file, &mut dest_file)
 }
 
 fn copy_directory(src: &Path, dest: &Path, opts: &Options, exit_code: &mut i32) -> io::Result<()> {
     // 自己参照チェック（サブディレクトリへのコピー防止）
+    // dest が未作成でも、存在する祖先まで正規化して判定する
+    // （ここを通すと dest 作成後の read_dir が dest 自身を拾い、無限再帰になる）
     let src_canonical = fs::canonicalize(src)?;
-    if let Ok(dest_canonical) = fs::canonicalize(dest) {
-        if dest_canonical.starts_with(&src_canonical) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("'{}' を自身のサブディレクトリ '{}' にコピーできません", 
-                    src.display(), dest.display()),
-            ));
-        }
+    let dest_full = resolve_full_path(dest);
+    if is_within(&src_canonical, &dest_full) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("'{}' を自身のサブディレクトリ '{}' にコピーできません",
+                src.display(), dest.display()),
+        ));
     }
-    
+
     // ディレクトリ作成
     if !dest.exists() {
         fs::create_dir_all(dest)?;
@@ -816,13 +909,106 @@ fn copy_directory(src: &Path, dest: &Path, opts: &Options, exit_code: &mut i32) 
     Ok(())
 }
 
+/// 存在しないパスでも、存在する祖先まで正規化した完全パスを返す
+fn resolve_full_path(path: &Path) -> PathBuf {
+    let mut cur = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(canonical) = fs::canonicalize(&cur) {
+            let mut result = canonical;
+            for name in tail.iter().rev() {
+                result.push(name);
+            }
+            return result;
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_os_string());
+                cur = if parent.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    parent.to_path_buf()
+                };
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// path が dir 自身またはその内部にあるか（Windowsは大文字小文字を区別しない）
+fn is_within(dir: &Path, path: &Path) -> bool {
+    let d = dir.to_string_lossy().to_lowercase();
+    let p = path.to_string_lossy().to_lowercase();
+    p == d
+        || (p.len() > d.len()
+            && p.starts_with(&d)
+            && matches!(p.as_bytes()[d.len()], b'/' | b'\\'))
+}
+
+/// VERSION_CONTROL 環境変数からデフォルトのバックアップモードを決定
+fn default_backup_mode() -> BackupMode {
+    match env::var("VERSION_CONTROL").ok().as_deref() {
+        Some("none") | Some("off") => BackupMode::None,
+        Some("simple") | Some("never") => BackupMode::Simple,
+        Some("numbered") | Some("t") => BackupMode::Numbered,
+        _ => BackupMode::Existing,
+    }
+}
+
 fn create_backup(path: &Path, opts: &Options) -> io::Result<()> {
-    let backup = PathBuf::from(format!("{}.bak", path.display()));
+    let backup = create_backup_path(path, opts);
     fs::rename(path, &backup)?;
     if opts.verbose {
         println!("バックアップ: '{}' -> '{}'", path.display(), backup.display());
     }
     Ok(())
+}
+
+fn create_backup_path(path: &Path, opts: &Options) -> PathBuf {
+    match opts.backup {
+        BackupMode::None | BackupMode::Simple => {
+            PathBuf::from(format!("{}{}", path.display(), opts.backup_suffix))
+        }
+        BackupMode::Numbered => next_numbered_backup(path),
+        BackupMode::Existing => {
+            if has_numbered_backup(path) {
+                next_numbered_backup(path)
+            } else {
+                PathBuf::from(format!("{}{}", path.display(), opts.backup_suffix))
+            }
+        }
+    }
+}
+
+fn next_numbered_backup(path: &Path) -> PathBuf {
+    let mut counter = 1;
+    loop {
+        let backup = PathBuf::from(format!("{}.~{}~", path.display(), counter));
+        if !backup.exists() {
+            return backup;
+        }
+        counter += 1;
+    }
+}
+
+fn has_numbered_backup(path: &Path) -> bool {
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        let prefix = format!("{}.~", name.to_string_lossy());
+        if let Ok(entries) = fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                let entry_name = entry.file_name().to_string_lossy().to_string();
+                if entry_name.starts_with(&prefix) && entry_name.ends_with('~') {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn is_newer(src: &Path, dest: &Path) -> io::Result<bool> {
@@ -845,7 +1031,7 @@ fn preserve_permissions(dest: &Path, src_metadata: &Metadata) -> io::Result<()> 
     let perms = src_metadata.permissions();
     match fs::set_permissions(dest, perms) {
         Ok(()) => Ok(()),
-        Err(e) if src_metadata.is_dir() => Ok(()),
+        Err(_) if src_metadata.is_dir() => Ok(()),
         Err(e) => Err(e),
     }
 }
