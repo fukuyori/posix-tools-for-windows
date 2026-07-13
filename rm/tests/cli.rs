@@ -196,6 +196,40 @@ fn broken_symlink_is_removable() {
 
 #[cfg(windows)]
 #[test]
+fn retries_while_another_process_holds_a_handle() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    // Dropbox やウイルス対策ソフトのハンドル保持を再現:
+    // FILE_SHARE_DELETE なしで開くと、削除は共有違反 (os error 32) になる
+    const FILE_SHARE_READ: u32 = 0x1;
+
+    let temp = tempdir().unwrap();
+    let dir = temp.path().join("tree");
+    fs::create_dir_all(dir.join("sub")).unwrap();
+    let locked = dir.join("sub").join("locked.txt");
+    fs::write(&locked, b"data").unwrap();
+
+    let handle = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&locked)
+        .unwrap();
+    let holder = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(handle);
+    });
+
+    // リトライ（合計約1.6秒）がハンドル解放を追い越すので成功する
+    rm().current_dir(temp.path())
+        .args(["-r", "tree"])
+        .assert()
+        .success();
+    holder.join().unwrap();
+    assert!(!dir.exists());
+}
+
+#[cfg(windows)]
+#[test]
 fn junction_inside_tree_does_not_delete_target_contents() {
     let temp = tempdir().unwrap();
     let target = temp.path().join("jtarget");

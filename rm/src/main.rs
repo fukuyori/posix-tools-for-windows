@@ -79,7 +79,7 @@ fn main() {
     }
 
     if opts.show_version {
-        println!("rm (Rust Windows版) 1.1.0");
+        println!("rm (Rust Windows版) 1.1.1");
         println!("POSIX.1-2017準拠 + GNU拡張");
         std::process::exit(0);
     }
@@ -391,10 +391,44 @@ fn delete_entry(path: &Path, metadata: &Metadata) -> io::Result<()> {
         let _ = remove_readonly(path);
     }
     if is_dir_link(metadata) {
-        fs::remove_dir(path)
+        retry_transient(|| fs::remove_dir(path))
     } else {
-        fs::remove_file(path)
+        retry_transient(|| fs::remove_file(path))
     }
+}
+
+/// リトライ間隔（合計約1.6秒）
+const RETRY_DELAYS_MS: &[u64] = &[10, 30, 60, 100, 200, 400, 800];
+
+/// 一時的な共有違反・削除保留によるエラーか
+///
+/// Windowsでは Dropbox・ウイルス対策ソフト・インデクサ等が一時的にハンドルを
+/// 保持していると、削除したファイルが「削除保留」となり名前が残る。このため
+/// 中身を消した直後の親ディレクトリ削除が「ディレクトリは空ではありません」
+/// (145) で失敗したり、対象自体が「別のプロセスが使用中」(32) になることがある。
+#[cfg(windows)]
+fn is_transient_error(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(5) | Some(32) | Some(145))
+}
+
+#[cfg(not(windows))]
+fn is_transient_error(_e: &io::Error) -> bool {
+    false
+}
+
+/// ハンドル保持が解けるのを待ちながら削除をリトライする
+fn retry_transient<F: FnMut() -> io::Result<()>>(mut op: F) -> io::Result<()> {
+    let mut result = op();
+    for delay in RETRY_DELAYS_MS {
+        match &result {
+            Err(e) if is_transient_error(e) => {
+                std::thread::sleep(std::time::Duration::from_millis(*delay));
+                result = op();
+            }
+            _ => break,
+        }
+    }
+    result
 }
 
 fn is_dot_or_dotdot(path: &Path) -> bool {
@@ -611,7 +645,15 @@ fn remove_dir_recursive(
         }
     }
 
-    match fs::remove_dir(path) {
+    // 中身を消した直後は削除保留（Dropbox等のハンドル保持）で
+    // 「空ではない」と報告されることがあるためリトライする。
+    // ただし中身の削除に失敗している場合は本当に空でないため即座に失敗させる
+    let remove_result = if had_error {
+        fs::remove_dir(path)
+    } else {
+        retry_transient(|| fs::remove_dir(path))
+    };
+    match remove_result {
         Ok(()) => {
             if opts.verbose {
                 println!("ディレクトリ '{}' を削除しました", path.display());
